@@ -1,0 +1,25 @@
+local_costmap:
+  global_frame: odom
+  robot_base_frame: base_link
+  update_frequency: 10.0
+  publish_frequency: 10.0
+  transform_tolerance: 0.2
+  static_map: false
+  rolling_window: true
+  width: 9.0
+  height: 9.0
+  resolution: 0.1
+  track_unknown_space: false
+  unknown_cost_value: 0
+  always_send_full_costmap: false
+
+  plugins:
+    - {name: obstacles, type: "costmap_2d::ObstacleLayer"}
+    - {name: predicted_path_obstacle_layer, type: "mrvk_gazebo::PredictedPathObstacleLayer"}
+    - {name: detected_path_layer, type: "costmap_2d::DetectedPathLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+
+  # Default: vypnute. Zapina sa explicitne v baylands.launch (vyzaduje aj
+  # spustenie path_detection_node, ktory publikuje /shoddy/detected_path).
+  detected_path_layer:
+    enabled: false

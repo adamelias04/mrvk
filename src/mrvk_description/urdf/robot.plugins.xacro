@@ -1,0 +1,142 @@
+<?xml version="1.0"?>
+<!-- ROS2 (Gazebo Classic + gazebo_ros_pkgs, Humble) plugin definitions.
+     Ported from the ROS1 skid-steer / imu / gpu_laser / camera plugins.
+     Topics kept identical to the ROS1 project:
+       /shoddy/cmd_vel  (input),  /shoddy/odom (output, + odom->base_link TF)
+       /scan            (LaserScan),  /imu_data (Imu),  /camera/* (image) -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <!-- ================= Differential (skid-steer) drive ================= -->
+    <!-- ROS2 gazebo_ros_diff_drive supports multiple wheel pairs, which
+         reproduces the 4-wheel skid steer of the ROS1 robot. -->
+    <gazebo>
+        <plugin name="skid_steer_drive_controller" filename="libgazebo_ros_diff_drive.so">
+            <ros>
+                <namespace>/shoddy</namespace>
+                <remapping>cmd_vel:=cmd_vel</remapping>
+                <remapping>odom:=odom</remapping>
+            </ros>
+
+            <update_rate>20.0</update_rate>
+
+            <num_wheel_pairs>2</num_wheel_pairs>
+            <left_joint>wheel_left_front_to_base_joint</left_joint>
+            <right_joint>wheel_right_front_to_base_joint</right_joint>
+            <left_joint>wheel_left_rear_to_base_joint</left_joint>
+            <right_joint>wheel_right_rear_to_base_joint</right_joint>
+
+            <wheel_separation>0.48</wheel_separation>
+            <wheel_separation>0.48</wheel_separation>
+            <wheel_diameter>0.23</wheel_diameter>
+            <wheel_diameter>0.23</wheel_diameter>
+
+            <max_wheel_torque>10.0</max_wheel_torque>
+            <max_wheel_acceleration>2.0</max_wheel_acceleration>
+
+            <command_topic>cmd_vel</command_topic>
+            <odometry_topic>odom</odometry_topic>
+            <odometry_frame>odom</odometry_frame>
+            <robot_base_frame>base_link</robot_base_frame>
+
+            <publish_odom>true</publish_odom>
+            <publish_odom_tf>true</publish_odom_tf>
+            <publish_wheel_tf>false</publish_wheel_tf>
+
+            <odometry_source>1</odometry_source>
+        </plugin>
+    </gazebo>
+
+    <!-- ============================== IMU ============================== -->
+    <gazebo reference="imu_link">
+        <sensor name="imu_sensor" type="imu">
+            <always_on>true</always_on>
+            <update_rate>20.0</update_rate>
+            <visualize>false</visualize>
+            <imu>
+                <angular_velocity>
+                    <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-4</stddev></noise></x>
+                    <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-4</stddev></noise></y>
+                    <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-4</stddev></noise></z>
+                </angular_velocity>
+                <linear_acceleration>
+                    <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></x>
+                    <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></y>
+                    <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></z>
+                </linear_acceleration>
+            </imu>
+            <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+                <ros>
+                    <remapping>~/out:=/imu_data</remapping>
+                </ros>
+                <frame_name>imu_link</frame_name>
+                <initial_orientation_as_reference>false</initial_orientation_as_reference>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <!-- ================= Hokuyo URG-04LX Laser Range Finder ================= -->
+    <gazebo reference="sensor_laser_link">
+        <sensor type="gpu_ray" name="head_hokuyo_sensor">
+            <pose>0.0 0.0 0.0 0.0 0.0 0.0</pose>
+            <visualize>false</visualize>
+            <update_rate>10.0</update_rate>
+            <ray>
+                <scan>
+                    <horizontal>
+                        <samples>1024</samples>
+                        <resolution>1</resolution>
+                        <min_angle>-2.094395102</min_angle>
+                        <max_angle>2.094395102</max_angle>
+                    </horizontal>
+                </scan>
+                <range>
+                    <min>0.06</min>
+                    <max>4.0</max>
+                    <resolution>0.001</resolution>
+                </range>
+                <noise>
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.01</stddev>
+                </noise>
+            </ray>
+            <plugin name="gazebo_ros_head_hokuyo_controller" filename="libgazebo_ros_ray_sensor.so">
+                <ros>
+                    <remapping>~/out:=/scan</remapping>
+                </ros>
+                <output_type>sensor_msgs/LaserScan</output_type>
+                <frame_name>sensor_laser_link</frame_name>
+            </plugin>
+        </sensor>
+    </gazebo>
+
+    <!-- ============================= Camera ============================= -->
+    <gazebo reference="camera_link">
+        <sensor type="camera" name="camera1">
+            <update_rate>30.0</update_rate>
+            <visualize>false</visualize>
+            <camera name="head">
+                <horizontal_fov>1.3962634</horizontal_fov>
+                <image>
+                    <width>800</width>
+                    <height>800</height>
+                    <format>R8G8B8</format>
+                </image>
+                <clip>
+                    <near>0.02</near>
+                    <far>300</far>
+                </clip>
+            </camera>
+            <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+                <ros>
+                    <namespace>/camera</namespace>
+                    <remapping>~/image_raw:=image_raw</remapping>
+                    <remapping>~/camera_info:=camera_info</remapping>
+                </ros>
+                <camera_name>camera</camera_name>
+                <frame_name>camera_link</frame_name>
+                <hack_baseline>0.07</hack_baseline>
+            </plugin>
+        </sensor>
+    </gazebo>
+</robot>

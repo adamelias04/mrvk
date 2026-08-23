@@ -1,0 +1,38 @@
+# GLOBAL PLANNER
+base_global_planner: navfn/NavfnROS
+
+# LOCAL PLANNER
+base_local_planner: base_local_planner/TrajectoryPlannerROS
+#base_local_planner: dwa_local_planner/DWAPlannerROS
+#base_local_planner: teb_local_planner/TebLocalPlannerROS
+# Recovery behaviours
+recovery_behaviors: [
+  {name: conservative_reset, type: clear_costmap_recovery/ClearCostmapRecovery},
+  {name: rotate_recovery, type: rotate_recovery/RotateRecovery},
+  {name: aggressive_reset, type: clear_costmap_recovery/ClearCostmapRecovery}
+]
+
+# Frequencies
+planner_frequency: 2.0
+controller_frequency: 12.0
+
+# Patience
+planner_patience: 2.5
+controller_patience: 6.0-
+
+# Reset distance
+conservative_reset_dist: 3.0
+
+# Recovery behaviour
+recovery_behavior_enabled: true
+clearing_rotation_allowed: true
+
+# Costmap handling
+shutdown_costmaps: false
+
+# Oscillation prevention
+oscillation_timeout: 0.0
+oscillation_distance: 0.5
+
+# Planning retries
+max_planning_retries: 5

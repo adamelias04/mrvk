@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypelang="RNG" ?>
+<package format="3">
+  <name>detected_path_layer</name>
+  <version>0.0.0</version>
+  <description>Nav2 costmap layer marking non-walkable cells from camera path detection (ROS2 port).</description>
+  <maintainer email="adam.eliasdk@gmail.com">adam</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav2_costmap_2d</depend>
+  <depend>pluginlib</depend>
+  <depend>path_detection</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <nav2_costmap_2d plugin="${prefix}/costmap_plugins.xml"/>
+  </export>
+</package>

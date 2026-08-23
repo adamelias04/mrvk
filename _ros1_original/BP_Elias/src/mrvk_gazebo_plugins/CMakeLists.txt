@@ -1,0 +1,36 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(mrvk_gazebo_plugins)
+
+find_package(catkin REQUIRED)
+find_package(gazebo REQUIRED)
+
+catkin_package(
+  LIBRARIES oscillate_box_plugin path_trail_visual_plugin
+)
+
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+  ${GAZEBO_INCLUDE_DIRS}
+)
+
+link_directories(${GAZEBO_LIBRARY_DIRS})
+
+add_library(oscillate_box_plugin SHARED
+  src/oscillate_box_plugin.cpp
+)
+
+target_link_libraries(oscillate_box_plugin
+  ${GAZEBO_LIBRARIES}
+)
+
+add_library(path_trail_visual_plugin SHARED
+  src/path_trail_visual_plugin.cpp
+)
+
+target_link_libraries(path_trail_visual_plugin
+  ${GAZEBO_LIBRARIES}
+)
+
+install(TARGETS oscillate_box_plugin path_trail_visual_plugin
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+)

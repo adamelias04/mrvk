@@ -1,0 +1,20 @@
+global_costmap:
+  global_frame: odom
+  robot_base_frame: base_link
+  update_frequency: 2.0
+  publish_frequency: 1.0
+  transform_tolerance: 0.5
+  static_map: false
+  rolling_window: true
+  width: 30.0
+  height: 30.0
+  resolution: 0.05
+  origin_x: -15.0
+  origin_y: -15.0
+  plugins:
+    - {name: obstacles, type: "costmap_2d::ObstacleLayer"}
+    - {name: detected_path_layer, type: "costmap_2d::DetectedPathLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+
+  detected_path_layer:
+    enabled: false

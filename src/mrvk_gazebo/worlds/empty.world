@@ -1,0 +1,110 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="default">
+
+    <gravity>0 0 -9.8</gravity>
+
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <model name="ground_plane">
+      <static>1</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>50 50</size>
+            </plane>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>100</mu>
+                <mu2>50</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <cast_shadows>0</cast_shadows>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>50 50</size>
+            </plane>
+          </geometry>
+          <material>
+            <script>
+              <uri>file://media/materials/scripts/gazebo.material</uri>
+              <name>Gazebo/Grey</name>
+            </script>
+          </material>
+          <!-- Vizualizacia prejdenej trajektorie. Plugin kompenzuje
+               scale ground_plane priamo v kode (world->local frame). -->
+          <plugin name="path_trail" filename="libpath_trail_visual_plugin.so">
+            <robot_name>robot</robot_name>
+            <min_distance>0.05</min_distance>
+            <line_z>0.05</line_z>
+          </plugin>
+        </visual>
+      </link>
+    </model>
+
+    <model name="center_box">
+      <static>false</static>
+      <pose>0 0 0.5 0 0 0</pose>
+
+      <link name="link">
+        <inertial>
+          <mass>2.0</mass>
+          <inertia>
+            <ixx>0.166</ixx>
+            <iyy>0.166</iyy>
+            <izz>0.166</izz>
+            <ixy>0.0</ixy>
+            <ixz>0.0</ixz>
+            <iyz>0.0</iyz>
+          </inertia>
+        </inertial>
+
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>1 1 1</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>1 1 1</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <plugin name="oscillate_box_plugin" filename="liboscillate_box_plugin.so">
+        <axis>y</axis>
+        <amplitude>3.0</amplitude>
+        <frequency>0.05</frequency>
+      </plugin>
+    </model>
+
+    <physics type="ode">
+      <max_step_size>0.01</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>100</real_time_update_rate>
+    </physics>
+
+    <!-- GUI pluginy (gazebo_goal_tool, gazebo_nav_goal_gui) su teraz
+         nacitane cez -g flag v gazebo.launch, takze funguju pre kazdy svet. -->
+
+  </world>
+</sdf>

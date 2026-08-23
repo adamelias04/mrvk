@@ -1,0 +1,63 @@
+DWAPlannerROS:
+    # Robot Configuration Parameters
+    # POZOR: prilis nizke acc + min_vel_trans 0.10 / min_vel_theta 0.30
+    # @ controller 12 Hz -> zo stoja sa do 1 cyklu neda dosiahnut min.
+    # rychlost -> "DWA failed to produce path" a robot stoji. Preto 3.0.
+    acc_lim_x: 3.0
+    acc_lim_y: 0.0
+    acc_lim_theta: 2.8
+    acc_lim_trans: 3.0
+
+    max_vel_trans: 1
+    min_vel_trans: 0.10
+
+    max_vel_x: 1
+    min_vel_x: 0.0
+    max_vel_y: 0.0
+    min_vel_y: 0.0
+
+    max_vel_theta: 1.0
+    min_vel_theta: 0.30
+    trans_stopped_vel: 0.10
+    theta_stopped_vel: 0.10
+
+    # Goal Tolerance Parameters
+    yaw_goal_tolerance: 0.20
+    xy_goal_tolerance: 0.20
+    latch_xy_goal_tolerance: false
+
+    # Forward Simulation Parameters
+    # dlhsi horizont -> DWA "vidi" prekazku skor a uhne ESTE nez sa
+    # priblizi (prevencia zaseknutia; ked je uz blizko, DWA neunikne).
+    sim_time: 2.0
+    sim_granularity: 0.025
+    angular_sim_granularity: 0.05
+    vx_samples: 20
+    vy_samples: 0
+    vth_samples: 40
+    use_dwa: true
+
+    # Trajectory Scoring Parameters (meter_scoring=true -> v metroch).
+    # Pri inflacnom prstenci je vysoky occdist_scale kontraproduktivny:
+    # s meter_scoring ma kratsia (pomalsia) trajektoria menej vysoko-
+    # nakladovych buniek -> DWA pri prekazke preferuje skoro stoj
+    # (plazenie). Nizky occdist_scale -> DWA pri prekazke nespomaluje
+    # extremne (prejde mierne blizsie, co je akceptovatelny kompromis).
+    # path_distance_bias nizky = smie sa od (tesnej) trasy odchylit.
+    meter_scoring: true
+    path_distance_bias: 20.0
+    goal_distance_bias: 20.0
+    occdist_scale: 0.20
+    forward_point_distance: 0.325
+    stop_time_buffer: 0.10
+    scaling_speed: 10.0
+    max_scaling_factor: 0.0
+    publish_cost_grid: false
+    global_frame_id: odom
+    penalize_negative_x: true
+
+    # Oscillation Prevention Parameters
+    oscillation_reset_dist: 0.10
+
+    # Global Plan Parameters
+    prune_plan: true

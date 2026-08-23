@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypelang="RNG" ?>
+<package format="3">
+  <name>gazebo_nav_goal_gui</name>
+  <version>0.0.0</version>
+  <description>Gazebo Classic GUI plugin to publish 2D nav goals to /goal_pose (ROS2 port).</description>
+  <maintainer email="adam.eliasdk@gmail.com">adam</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>gazebo_ros</depend>
+  <depend>gazebo_dev</depend>
+  <depend>qtbase5-dev</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <gazebo_ros gazebo_plugin_path="${prefix}/lib"/>
+  </export>
+</package>

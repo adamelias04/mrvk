@@ -1,0 +1,32 @@
+TebLocalPlannerROS:
+  odom_topic: odom
+  map_frame: odom
+
+  # Robot (diff drive)
+  max_vel_x: 1
+  max_vel_x_backwards: 0.8
+  max_vel_theta: 1
+  acc_lim_x: 3.0
+  acc_lim_theta: 2.8
+
+  # Footprint / safety
+  footprint_model:
+    type: "circular"
+    radius: 0.28    
+  min_obstacle_dist: 0.15
+  inflation_dist: 0.30
+
+  xy_goal_tolerance: 0.20
+  yaw_goal_tolerance: 0.20
+  free_goal_vel: true
+
+
+  # Optimalizácia
+  teb_autosize: true
+  dt_ref: 0.3
+  dt_hysteresis: 0.1
+  weight_obstacle: 80.0
+  weight_viapoint: 20
+  weight_kinematics_nh: 1000.0
+  weight_kinematics_forward_drive: 2.0   # nizsie = TEB smie cuvnut (head-on uhybny manever)
+  weight_optimaltime: 0.8

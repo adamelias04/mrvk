@@ -1,0 +1,8 @@
+<library path="detected_path_layer">
+  <class type="detected_path_layer::DetectedPathLayer" base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Detected Path Layer that marks LETHAL obstacles where the walkable path is
+      not detected; the detected path is kept as passable space. ROS2/Nav2 port.
+    </description>
+  </class>
+</library>
