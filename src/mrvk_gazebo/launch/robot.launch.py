@@ -24,10 +24,10 @@ def generate_launch_description():
     # s world_file:=<...>/test_static.world  safety_filter:=false.
     default_world = os.path.join(pkg, 'worlds', 'empty.world')
     slam_params = os.path.join(pkg, 'config', 'slam', 'slam_toolbox.yaml')
+    predictor_params = os.path.join(pkg, 'config', 'predictor', 'dynamic_obstacle_predictor.yaml')
 
     world_file = LaunchConfiguration('world_file')
     planner = LaunchConfiguration('planner')
-    laser_topic = LaunchConfiguration('laser_topic')
     odom_topic = LaunchConfiguration('odom_topic')
     safety_filter = LaunchConfiguration('safety_filter')
 
@@ -61,46 +61,17 @@ def generate_launch_description():
         launch_arguments={'planner': planner, 'cmd_vel_out': cmd_topic}.items(),
     )
 
+    # NOTE: dynamic_obstacle_predictor now consumes the ground-segmented
+    # obstacle point cloud (/ground_segmentation/obstacle_points), which the
+    # Gazebo sim does not produce (no raw 3D pointcloud sensor in-sim, only
+    # a native 2D /scan). It will launch but receive no data until a 3D
+    # sensor + ground_segmentation are added to the sim world.
     dynamic_obstacle_predictor = Node(
         package='mrvk_gazebo', executable='dynamic_obstacle_predictor',
         name='dynamic_obstacle_predictor', output='screen',
         condition=IfCondition(safety_filter),
-        parameters=[{
+        parameters=[predictor_params, {
             'use_sim_time': True,
-            'scan_topic': laser_topic,
-            'output_frame': 'odom',
-            'prediction_time': 4.0,
-            'prediction_dt': 0.1,
-            'alpha_gain': 0.65,
-            'beta_gain': 0.20,
-            'max_speed': 2.0,
-            'track_timeout': 1.2,
-            'lost_track_prediction_time': 1.6,
-            'prediction_hold_time': 0.8,
-            'prediction_hold_speed_epsilon': 0.08,
-            'min_dynamic_speed': 0.3,
-            'min_dynamic_persist': 0.35,
-            'point_spacing': 0.05,
-            'corridor_radius': 0.18,
-            'object_half_extent': 0.18,
-            'z_height': 0.10,
-            'scan_range_min_use': 0.10,
-            'scan_range_max_use': 8.00,
-            'segment_jump_distance': 0.30,
-            'segment_min_points': 2,
-            'segment_max_points': 120,
-            'segment_min_width': 0.03,
-            'segment_max_width': 2.00,
-            'use_angle_roi': False,
-            'angle_min_roi': -1.57,
-            'angle_max_roi': 1.57,
-            'use_range_roi': False,
-            'range_min_roi': 0.20,
-            'range_max_roi': 8.00,
-            'initial_expected_angle': 0.0,
-            'initial_expected_range': 2.5,
-            'max_association_distance': 2.0,
-            'publish_debug_segment': True,
         }],
     )
 
@@ -185,10 +156,9 @@ def generate_launch_description():
                                           'safety filter (false = planner drives '
                                           'the robot directly; useful for static '
                                           'benchmark worlds)'),
-        DeclareLaunchArgument('laser_topic', default_value='/scan'),
         DeclareLaunchArgument('odom_topic', default_value='/shoddy/odom'),
         DeclareLaunchArgument('init_x', default_value='3.0'),
-        DeclareLaunchArgument('init_y', default_value='0.0'),
+        DeclareLaunchArgument('init_y', default_value='3.0'),
         DeclareLaunchArgument('init_z', default_value='0.3'),
         DeclareLaunchArgument('init_yaw', default_value='3.14'),
         gazebo,
@@ -199,3 +169,4 @@ def generate_launch_description():
         path_recorder,
         rqt_steering,
     ])
+

@@ -1,17 +1,24 @@
 // ROS2 (rclcpp) port of the dynamic obstacle detector/predictor.
-// Detects and tracks a single dynamic obstacle from a 2D lidar scan using an
-// alpha-beta filter (position+velocity) and a constant-velocity prediction.
-// Publishes /detected_obstacle_pose (instantaneous position) and
-// /predicted_obstacle_path (predicted trajectory).
+// Detects and tracks multiple simultaneous dynamic obstacles from the
+// ground-segmented obstacle point cloud (/ground_segmentation/obstacle_points)
+// using per-object alpha-beta filters (position+velocity) and
+// constant-velocity predictions. Publishes /detected_obstacle_pose and
+// /predicted_obstacle_path for the single closest ("primary") track only,
+// for backward compatibility with robot_motion_predictor (not yet updated
+// to consume multiple tracks); /predicted_obstacle_markers,
+// /predicted_obstacle_velocity_marker and /predicted_obstacle_debug_segment
+// are MarkerArrays covering every currently tracked object.
 
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
@@ -47,6 +54,24 @@ struct Point2D
     double y;
 };
 
+struct Track
+{
+    int id{0};
+    Point2D position{0.0, 0.0};
+    double vx{0.0};
+    double vy{0.0};
+    rclcpp::Time last_stamp{0, 0, RCL_ROS_TIME};
+    bool has_held_velocity{false};
+    rclcpp::Time held_velocity_stamp{0, 0, RCL_ROS_TIME};
+    double held_vx{0.0};
+    double held_vy{0.0};
+    rclcpp::Time dynamic_streak_start{0, 0, RCL_ROS_TIME};
+    double last_range{0.0};
+    bool matched_this_cycle{false};
+    bool pending_dead_reckon{false};
+    Point2D dead_reckon_origin{0.0, 0.0};
+};
+
 class DynamicObstaclePredictor : public rclcpp::Node
 {
 public:
@@ -58,10 +83,9 @@ public:
 
         loadParams();
         setupIO();
-        resetTrack();
         RCLCPP_INFO(get_logger(),
-                    "dynamic_obstacle_predictor started (scan=%s frame=%s)",
-                    scan_topic_.c_str(), output_frame_.c_str());
+                    "dynamic_obstacle_predictor started (obstacle_cloud=%s frame=%s, max_tracks=%d)",
+                    obstacle_cloud_topic_.c_str(), output_frame_.c_str(), max_tracks_);
     }
 
 private:
@@ -77,7 +101,8 @@ private:
 
     void loadParams()
     {
-        scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
+        obstacle_cloud_topic_ = declare_parameter<std::string>(
+            "obstacle_cloud_topic", "/ground_segmentation/obstacle_points");
         output_frame_ = declare_parameter<std::string>("output_frame", "odom");
 
         prediction_time_ = declare_parameter<double>("prediction_time", 1.0);
@@ -95,6 +120,7 @@ private:
         point_spacing_ = declare_parameter<double>("point_spacing", 0.05);
         corridor_radius_ = declare_parameter<double>("corridor_radius", 0.18);
         object_half_extent_ = declare_parameter<double>("object_half_extent", 0.18);
+        center_side_hysteresis_ = declare_parameter<double>("center_side_hysteresis", 0.5);
         z_height_ = declare_parameter<double>("z_height", 0.10);
 
         scan_range_min_use_ = declare_parameter<double>("scan_range_min_use", 0.10);
@@ -116,69 +142,72 @@ private:
         initial_expected_range_ = declare_parameter<double>("initial_expected_range", 2.0);
         max_association_distance_ = declare_parameter<double>("max_association_distance", 1.5);
         publish_debug_segment_ = declare_parameter<bool>("publish_debug_segment", true);
+        max_tracks_ = declare_parameter<int>("max_tracks", 5);
     }
 
     void setupIO()
     {
         rclcpp::QoS qos(rclcpp::KeepLast(1));
-        scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-            scan_topic_, rclcpp::SensorDataQoS(),
-            std::bind(&DynamicObstaclePredictor::scanCallback, this, std::placeholders::_1));
+        obstacle_cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+            obstacle_cloud_topic_, rclcpp::SensorDataQoS(),
+            std::bind(&DynamicObstaclePredictor::cloudCallback, this, std::placeholders::_1));
 
         detected_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/detected_obstacle_pose", qos);
         predicted_path_pub_ = create_publisher<nav_msgs::msg::Path>("/predicted_obstacle_path", qos);
         predicted_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud>("/predicted_obstacle_cloud", qos);
-        predicted_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/predicted_obstacle_markers", qos);
-        debug_segment_pub_ = create_publisher<visualization_msgs::msg::Marker>("/predicted_obstacle_debug_segment", qos);
-        velocity_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/predicted_obstacle_velocity_marker", qos);
+        predicted_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_markers", qos);
+        debug_segment_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_debug_segment", qos);
+        velocity_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_velocity_marker", qos);
     }
 
     // ---- track management -------------------------------------------
 
-    void resetTrack()
+    Track& spawnTrack(const Point2D& p, const rclcpp::Time& stamp)
     {
-        has_track_ = false;
-        last_track_stamp_ = zeroTime();
-        tracked_position_ = {0.0, 0.0};
-        vx_ = 0.0;
-        vy_ = 0.0;
-        has_held_velocity_ = false;
-        held_velocity_stamp_ = zeroTime();
-        held_vx_ = 0.0;
-        held_vy_ = 0.0;
-        dynamic_streak_start_ = zeroTime();
+        Track t;
+        t.id = next_track_id_++;
+        t.position = p;
+        t.vx = 0.0;
+        t.vy = 0.0;
+        t.last_stamp = stamp;
+        t.dynamic_streak_start = zeroTime();
+        tracks_.push_back(t);
+        return tracks_.back();
     }
 
-    void initializeTrack(const Point2D& p, const rclcpp::Time& stamp)
+    void reinitTrackInPlace(Track& t, const Point2D& p, const rclcpp::Time& stamp)
     {
-        tracked_position_ = p;
-        vx_ = 0.0;
-        vy_ = 0.0;
-        last_track_stamp_ = stamp;
-        has_track_ = true;
-        dynamic_streak_start_ = zeroTime();
+        t.position = p;
+        t.vx = 0.0;
+        t.vy = 0.0;
+        t.last_stamp = stamp;
+        t.has_held_velocity = false;
+        t.held_velocity_stamp = zeroTime();
+        t.held_vx = 0.0;
+        t.held_vy = 0.0;
+        t.dynamic_streak_start = zeroTime();
     }
 
-    void updateTrack(const Point2D& measurement, double dt)
+    void updateTrack(Track& t, const Point2D& measurement, double dt)
     {
         Point2D predicted;
-        predicted.x = tracked_position_.x + vx_ * dt;
-        predicted.y = tracked_position_.y + vy_ * dt;
+        predicted.x = t.position.x + t.vx * dt;
+        predicted.y = t.position.y + t.vy * dt;
 
         const double rx = measurement.x - predicted.x;
         const double ry = measurement.y - predicted.y;
 
-        tracked_position_.x = predicted.x + alpha_gain_ * rx;
-        tracked_position_.y = predicted.y + alpha_gain_ * ry;
+        t.position.x = predicted.x + alpha_gain_ * rx;
+        t.position.y = predicted.y + alpha_gain_ * ry;
 
         if (dt > 1e-4)
         {
-            vx_ += (beta_gain_ / dt) * rx;
-            vy_ += (beta_gain_ / dt) * ry;
+            t.vx += (beta_gain_ / dt) * rx;
+            t.vy += (beta_gain_ / dt) * ry;
         }
 
-        vx_ = clamp(vx_, -max_speed_, max_speed_);
-        vy_ = clamp(vy_, -max_speed_, max_speed_);
+        t.vx = clamp(t.vx, -max_speed_, max_speed_);
+        t.vy = clamp(t.vy, -max_speed_, max_speed_);
     }
 
     // ---- velocity helpers -------------------------------------------
@@ -188,39 +217,38 @@ private:
         return std::sqrt(vx * vx + vy * vy);
     }
 
-    void refreshHeldVelocity(const rclcpp::Time& stamp)
+    void refreshHeldVelocity(Track& t, const rclcpp::Time& stamp)
     {
-        if (speedNorm(vx_, vy_) < prediction_hold_speed_epsilon_)
+        if (speedNorm(t.vx, t.vy) < prediction_hold_speed_epsilon_)
             return;
-        held_vx_ = vx_;
-        held_vy_ = vy_;
-        held_velocity_stamp_ = stamp;
-        has_held_velocity_ = true;
+        t.held_vx = t.vx;
+        t.held_vy = t.vy;
+        t.held_velocity_stamp = stamp;
+        t.has_held_velocity = true;
     }
 
-    void selectPredictionVelocity(const rclcpp::Time& stamp, double& pred_vx, double& pred_vy) const
+    void selectPredictionVelocity(const Track& t, const rclcpp::Time& stamp, double& pred_vx, double& pred_vy) const
     {
-        pred_vx = vx_;
-        pred_vy = vy_;
+        pred_vx = t.vx;
+        pred_vy = t.vy;
 
         if (speedNorm(pred_vx, pred_vy) >= prediction_hold_speed_epsilon_)
             return;
-        if (!has_held_velocity_ || isZero(held_velocity_stamp_))
+        if (!t.has_held_velocity || isZero(t.held_velocity_stamp))
             return;
-        if (std::fabs((stamp - held_velocity_stamp_).seconds()) > prediction_hold_time_)
+        if (std::fabs((stamp - t.held_velocity_stamp).seconds()) > prediction_hold_time_)
             return;
 
-        pred_vx = held_vx_;
-        pred_vy = held_vy_;
+        pred_vx = t.held_vx;
+        pred_vy = t.held_vy;
     }
 
-    Point2D predictTrackPosition(const rclcpp::Time& stamp) const
+    Point2D predictTrackPosition(const Track& t, const rclcpp::Time& stamp) const
     {
-        Point2D p = tracked_position_;
-        if (!has_track_) return p;
-        const double dt = std::max(0.0, (stamp - last_track_stamp_).seconds());
-        p.x += vx_ * dt;
-        p.y += vy_ * dt;
+        Point2D p = t.position;
+        const double dt = std::max(0.0, (stamp - t.last_stamp).seconds());
+        p.x += t.vx * dt;
+        p.y += t.vy * dt;
         return p;
     }
 
@@ -231,7 +259,7 @@ private:
         return std::max(lo, std::min(hi, v));
     }
 
-    bool validRange(float r) const
+    bool validRange(double r) const
     {
         return std::isfinite(r) && r >= scan_range_min_use_ && r <= scan_range_max_use_;
     }
@@ -256,28 +284,46 @@ private:
         return std::hypot(a.x - b.x, a.y - b.y);
     }
 
-    // ---- scan processing -------------------------------------------
+    // ---- cloud processing -------------------------------------------
 
-    std::vector<ScanPoint> extractValidPoints(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan_msg)
+    // Ground already removed upstream by ground_segmentation_ros2_node, so
+    // every point here is a candidate obstacle. Flatten to 2D (x,y) in the
+    // cloud's own frame and derive range/angle around that frame's origin,
+    // then sort by angle so buildSegments' sequential jump-distance
+    // clustering (written for angularly-ordered LaserScan rays) still holds
+    // on an otherwise unordered point cloud.
+    std::vector<ScanPoint> extractValidPointsFromCloud(
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg)
     {
         std::vector<ScanPoint> pts;
-        pts.reserve(scan_msg->ranges.size());
-        double angle = scan_msg->angle_min;
+        pts.reserve(static_cast<std::size_t>(cloud_msg->width) * cloud_msg->height);
 
-        for (std::size_t i = 0; i < scan_msg->ranges.size(); ++i, angle += scan_msg->angle_increment)
+        sensor_msgs::PointCloud2ConstIterator<float> it_x(*cloud_msg, "x");
+        sensor_msgs::PointCloud2ConstIterator<float> it_y(*cloud_msg, "y");
+
+        int idx = 0;
+        for (; it_x != it_x.end(); ++it_x, ++it_y, ++idx)
         {
-            const float r = scan_msg->ranges[i];
-            if (!validRange(r) || !insideAngleROI(angle) || !insideRangeROI(r))
+            const double x = static_cast<double>(*it_x);
+            const double y = static_cast<double>(*it_y);
+            if (!std::isfinite(x) || !std::isfinite(y)) continue;
+
+            const double range = std::hypot(x, y);
+            const double angle = std::atan2(y, x);
+            if (!validRange(range) || !insideAngleROI(angle) || !insideRangeROI(range))
                 continue;
 
             ScanPoint p;
-            p.range = static_cast<double>(r);
+            p.range = range;
             p.angle = angle;
-            p.x_laser = p.range * std::cos(angle);
-            p.y_laser = p.range * std::sin(angle);
-            p.index = static_cast<int>(i);
+            p.x_laser = x;
+            p.y_laser = y;
+            p.index = idx;
             pts.push_back(p);
         }
+
+        std::sort(pts.begin(), pts.end(),
+                  [](const ScanPoint& a, const ScanPoint& b) { return a.angle < b.angle; });
         return pts;
     }
 
@@ -326,11 +372,21 @@ private:
 
     // ---- segment geometry ------------------------------------------
 
+    // Centroid over every point in the segment, not just the two angular
+    // extremes: with the dense pointcloud-derived segments (dozens to
+    // hundreds of points) the extreme points are the noisiest ones, and a
+    // first/last average made the estimated center jump between frames
+    // enough to break track continuity or masquerade as velocity.
     Point2D segmentMidpointLaser(const Segment& s) const
     {
-        const ScanPoint& a = s.points.front();
-        const ScanPoint& b = s.points.back();
-        return {0.5 * (a.x_laser + b.x_laser), 0.5 * (a.y_laser + b.y_laser)};
+        double sum_x = 0.0, sum_y = 0.0;
+        for (const auto& p : s.points)
+        {
+            sum_x += p.x_laser;
+            sum_y += p.y_laser;
+        }
+        const double n = static_cast<double>(s.points.size());
+        return {sum_x / n, sum_y / n};
     }
 
     Point2D shiftPoint(const Point2D& origin, const Point2D& dir, double distance) const
@@ -338,10 +394,15 @@ private:
         return {origin.x + dir.x * distance, origin.y + dir.y * distance};
     }
 
+    // ref == nullptr: no candidate track to disambiguate against, pick the
+    // candidate farther from the sensor. ref != nullptr: pick whichever
+    // candidate is closer (in world frame) to *ref (a specific track's
+    // predicted position).
     bool estimateSegmentCenterLaser(const Segment& s,
                                     const std::string& laser_frame,
                                     const rclcpp::Time& stamp,
-                                    Point2D& center_laser)
+                                    Point2D& center_laser,
+                                    const Point2D* ref = nullptr)
     {
         const Point2D midpoint = segmentMidpointLaser(s);
         const ScanPoint& first = s.points.front();
@@ -367,7 +428,7 @@ private:
         const Point2D candidate_a = shiftPoint(midpoint, normal_a, object_half_extent_);
         const Point2D candidate_b = shiftPoint(midpoint, normal_b, object_half_extent_);
 
-        if (!has_track_)
+        if (!ref)
         {
             const double range_a = std::hypot(candidate_a.x, candidate_a.y);
             const double range_b = std::hypot(candidate_b.x, candidate_b.y);
@@ -383,9 +444,34 @@ private:
             return true;
         }
 
-        center_laser = (distWorld(cand_a_world, tracked_position_) <=
-                         distWorld(cand_b_world, tracked_position_))
-                            ? candidate_a : candidate_b;
+        // Two disambiguation signals: geometric (farther from the sensor is
+        // almost always the true far side of the object, and is stable
+        // frame to frame since it only depends on this segment) and
+        // kinematic (closer to the track's predicted position, which is
+        // what actually matters when the object is genuinely moving). They
+        // usually agree. When they don't, trust kinematics only if it wins
+        // by a clear margin -- otherwise a near-tie in predicted-position
+        // distance (typical while viewing a static object near a symmetric
+        // angle) flips the choice every few frames, and the resulting
+        // ~2*object_half_extent_ position jump gets read by the alpha-beta
+        // filter as spurious velocity on an object that never moved.
+        const double range_a = std::hypot(candidate_a.x, candidate_a.y);
+        const double range_b = std::hypot(candidate_b.x, candidate_b.y);
+        const bool geometric_prefers_a = range_a >= range_b;
+
+        const double da = distWorld(cand_a_world, *ref);
+        const double db = distWorld(cand_b_world, *ref);
+        const bool kinematic_prefers_a = da <= db;
+
+        bool prefer_a = geometric_prefers_a;
+        if (geometric_prefers_a != kinematic_prefers_a)
+        {
+            const double kinematic_margin = std::fabs(da - db);
+            if (kinematic_margin > center_side_hysteresis_ * object_half_extent_)
+                prefer_a = kinematic_prefers_a;
+        }
+
+        center_laser = prefer_a ? candidate_a : candidate_b;
         return true;
     }
 
@@ -417,76 +503,77 @@ private:
         return true;
     }
 
-    // ---- segment selection ------------------------------------------
+    // ---- segment <-> track assignment --------------------------------
 
-    bool selectSegment(const std::vector<Segment>& segments,
-                       const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan_msg,
-                       Segment& selected,
-                       Point2D& selected_world)
+    struct Assignment
     {
-        if (segments.empty()) return false;
+        std::vector<int> track_to_segment;   // size == tracks_.size(), -1 if unmatched
+        std::vector<Point2D> track_measurement_world;
+        std::vector<bool> segment_used;      // size == segments.size()
+    };
 
-        const rclcpp::Time stamp(scan_msg->header.stamp);
-        const Point2D assoc_ref = has_track_
-            ? predictTrackPosition(stamp)
-            : Point2D{0.0, 0.0};
+    Assignment assignSegmentsToTracks(const std::vector<Segment>& segments,
+                                      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg,
+                                      const rclcpp::Time& stamp)
+    {
+        Assignment result;
+        result.track_to_segment.assign(tracks_.size(), -1);
+        result.track_measurement_world.assign(tracks_.size(), Point2D{0.0, 0.0});
+        result.segment_used.assign(segments.size(), false);
 
-        double best_score = std::numeric_limits<double>::infinity();
-        int best_idx = -1;
-        Point2D best_world{};
+        struct Candidate { std::size_t track_i; std::size_t seg_j; double cost; Point2D world; };
+        std::vector<Candidate> candidates;
 
-        for (std::size_t i = 0; i < segments.size(); ++i)
+        for (std::size_t i = 0; i < tracks_.size(); ++i)
         {
-            std::vector<Point2D> candidates_laser;
-            Point2D est_center;
-            if (estimateSegmentCenterLaser(segments[i], scan_msg->header.frame_id,
-                                           stamp, est_center))
-                candidates_laser.push_back(est_center);
-            candidates_laser.push_back(segmentMidpointLaser(segments[i]));
+            const Point2D assoc_ref = predictTrackPosition(tracks_[i], stamp);
 
-            double seg_best = std::numeric_limits<double>::infinity();
-            Point2D seg_best_world{};
-
-            for (const Point2D& cl : candidates_laser)
+            for (std::size_t j = 0; j < segments.size(); ++j)
             {
-                Point2D cw;
-                if (!laserPointToWorld(cl, scan_msg->header.frame_id, stamp, cw))
-                    continue;
+                std::vector<Point2D> candidates_laser;
+                Point2D est_center;
+                if (estimateSegmentCenterLaser(segments[j], cloud_msg->header.frame_id,
+                                               stamp, est_center, &assoc_ref))
+                    candidates_laser.push_back(est_center);
+                candidates_laser.push_back(segmentMidpointLaser(segments[j]));
 
-                double score = 0.0;
-                if (has_track_)
+                double best = std::numeric_limits<double>::infinity();
+                Point2D best_world{};
+                for (const Point2D& cl : candidates_laser)
                 {
+                    Point2D cw;
+                    if (!laserPointToWorld(cl, cloud_msg->header.frame_id, stamp, cw))
+                        continue;
                     const double d = distWorld(cw, assoc_ref);
                     if (d > max_association_distance_ + object_half_extent_)
                         continue;
-                    score = d;
-                }
-                else
-                {
-                    const double da = segments[i].mean_angle - initial_expected_angle_;
-                    const double dr = segments[i].mean_range - initial_expected_range_;
-                    score = std::sqrt(da * da + dr * dr);
+                    if (d < best)
+                    {
+                        best = d;
+                        best_world = cw;
+                    }
                 }
 
-                if (score < seg_best)
-                {
-                    seg_best = score;
-                    seg_best_world = cw;
-                }
-            }
-
-            if (seg_best < best_score)
-            {
-                best_score = seg_best;
-                best_idx = static_cast<int>(i);
-                best_world = seg_best_world;
+                if (std::isfinite(best))
+                    candidates.push_back({i, j, best, best_world});
             }
         }
 
-        if (best_idx < 0) return false;
-        selected = segments[best_idx];
-        selected_world = best_world;
-        return true;
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) { return a.cost < b.cost; });
+
+        std::vector<bool> track_claimed(tracks_.size(), false);
+        for (const auto& c : candidates)
+        {
+            if (track_claimed[c.track_i] || result.segment_used[c.seg_j])
+                continue;
+            track_claimed[c.track_i] = true;
+            result.segment_used[c.seg_j] = true;
+            result.track_to_segment[c.track_i] = static_cast<int>(c.seg_j);
+            result.track_measurement_world[c.track_i] = c.world;
+        }
+
+        return result;
     }
 
     // ---- publishing -------------------------------------------------
@@ -532,92 +619,83 @@ private:
         }
     }
 
-    void publishPrediction(const rclcpp::Time& stamp, double horizon)
+    // Result of evaluating one track's prediction for this cycle. Does not
+    // publish anything itself; the caller aggregates these across tracks
+    // into MarkerArrays and picks the primary track for the singular topics.
+    struct TrackPrediction
     {
-        publishPredictionFrom(tracked_position_, stamp, horizon);
-    }
+        bool dynamic{false};
+        Point2D origin{0.0, 0.0};
+        double vx{0.0};
+        double vy{0.0};
+        std::vector<geometry_msgs::msg::PoseStamped> poses;
+    };
 
-    void publishPredictionFrom(const Point2D& origin, const rclcpp::Time& stamp, double horizon)
+    TrackPrediction buildTrackPrediction(Track& t, const Point2D& origin,
+                                         const rclcpp::Time& stamp, double horizon,
+                                         const std_msgs::msg::Header& header)
     {
-        if (!has_track_) return;
+        TrackPrediction result;
+        result.origin = origin;
 
         double pred_vx = 0.0, pred_vy = 0.0;
-        selectPredictionVelocity(stamp, pred_vx, pred_vy);
+        selectPredictionVelocity(t, stamp, pred_vx, pred_vy);
 
         if (speedNorm(pred_vx, pred_vy) < min_dynamic_speed_)
         {
-            dynamic_streak_start_ = zeroTime();
-            clearPublishedPrediction(stamp);
-            return;
+            t.dynamic_streak_start = zeroTime();
+            return result;
         }
-        if (isZero(dynamic_streak_start_))
-            dynamic_streak_start_ = stamp;
-        if ((stamp - dynamic_streak_start_).seconds() < min_dynamic_persist_)
+        if (isZero(t.dynamic_streak_start))
+            t.dynamic_streak_start = stamp;
+        if ((stamp - t.dynamic_streak_start).seconds() < min_dynamic_persist_)
+            return result;
+
+        result.dynamic = true;
+        result.vx = pred_vx;
+        result.vy = pred_vy;
+
+        for (double time = 0.0; time <= horizon + 1e-6; time += prediction_dt_)
         {
-            clearPublishedPrediction(stamp);
-            return;
+            geometry_msgs::msg::PoseStamped pose;
+            pose.header = header;
+            pose.pose.orientation.w = 1.0;
+            pose.pose.position.x = origin.x + pred_vx * time;
+            pose.pose.position.y = origin.y + pred_vy * time;
+            pose.pose.position.z = z_height_;
+            result.poses.push_back(pose);
         }
+        return result;
+    }
 
-        nav_msgs::msg::Path path;
-        path.header.stamp = stamp;
-        path.header.frame_id = output_frame_;
-
+    visualization_msgs::msg::Marker lineStripMarkerFor(const TrackPrediction& pred,
+                                                       const std_msgs::msg::Header& header,
+                                                       int id)
+    {
         visualization_msgs::msg::Marker marker;
-        marker.header = path.header;
+        marker.header = header;
         marker.ns = "predicted_obstacle";
-        marker.id = 0;
+        marker.id = id;
         marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
         marker.action = visualization_msgs::msg::Marker::ADD;
         marker.pose.orientation.w = 1.0;
         marker.scale.x = 0.05;
         marker.color.r = 1.0;
         marker.color.a = 1.0;
-
-        sensor_msgs::msg::PointCloud cloud;
-        cloud.header = path.header;
-
-        double last_x = origin.x, last_y = origin.y, last_z = z_height_;
-
-        for (double t = 0.0; t <= horizon + 1e-6; t += prediction_dt_)
-        {
-            const double px = origin.x + pred_vx * t;
-            const double py = origin.y + pred_vy * t;
-            const double pz = z_height_;
-
-            geometry_msgs::msg::PoseStamped pose;
-            pose.header = path.header;
-            pose.pose.orientation.w = 1.0;
-            pose.pose.position.x = px;
-            pose.pose.position.y = py;
-            pose.pose.position.z = pz;
-            path.poses.push_back(pose);
-
-            geometry_msgs::msg::Point pt;
-            pt.x = px; pt.y = py; pt.z = pz;
-            marker.points.push_back(pt);
-
-            addDenseSegment(cloud, last_x, last_y, last_z, px, py, pz);
-            last_x = px; last_y = py; last_z = pz;
-        }
-
-        predicted_path_pub_->publish(path);
-        predicted_marker_pub_->publish(marker);
-        predicted_cloud_pub_->publish(cloud);
-        publishVelocityMarker(origin, stamp);
+        for (const auto& pose : pred.poses)
+            marker.points.push_back(pose.pose.position);
+        return marker;
     }
 
-    void publishVelocityMarker(const Point2D& origin, const rclcpp::Time& stamp)
+    visualization_msgs::msg::Marker velocityMarkerFor(const TrackPrediction& pred,
+                                                       const rclcpp::Time& stamp,
+                                                       int id)
     {
-        if (!has_track_) return;
-
-        double marker_vx = 0.0, marker_vy = 0.0;
-        selectPredictionVelocity(stamp, marker_vx, marker_vy);
-
         visualization_msgs::msg::Marker marker;
         marker.header.stamp = stamp;
         marker.header.frame_id = output_frame_;
         marker.ns = "predicted_obstacle_velocity";
-        marker.id = 0;
+        marker.id = id;
         marker.type = visualization_msgs::msg::Marker::ARROW;
         marker.action = visualization_msgs::msg::Marker::ADD;
         marker.pose.orientation.w = 1.0;
@@ -629,27 +707,25 @@ private:
         marker.color.a = 1.0;
 
         geometry_msgs::msg::Point p0, p1;
-        p0.x = origin.x; p0.y = origin.y; p0.z = z_height_;
-        p1.x = origin.x + 0.5 * marker_vx;
-        p1.y = origin.y + 0.5 * marker_vy;
+        p0.x = pred.origin.x; p0.y = pred.origin.y; p0.z = z_height_;
+        p1.x = pred.origin.x + 0.5 * pred.vx;
+        p1.y = pred.origin.y + 0.5 * pred.vy;
         p1.z = z_height_;
         marker.points.push_back(p0);
         marker.points.push_back(p1);
-
-        velocity_marker_pub_->publish(marker);
+        return marker;
     }
 
-    void publishDebugSegment(const Segment& seg,
-                             const std::string& laser_frame,
-                             const rclcpp::Time& stamp)
+    visualization_msgs::msg::Marker debugSegmentMarkerFor(const Segment& seg,
+                                                           const std::string& laser_frame,
+                                                           const rclcpp::Time& stamp,
+                                                           int id)
     {
-        if (!publish_debug_segment_) return;
-
         visualization_msgs::msg::Marker marker;
         marker.header.stamp = stamp;
         marker.header.frame_id = output_frame_;
         marker.ns = "predicted_obstacle_debug_segment";
-        marker.id = 0;
+        marker.id = id;
         marker.type = visualization_msgs::msg::Marker::POINTS;
         marker.action = visualization_msgs::msg::Marker::ADD;
         marker.pose.orientation.w = 1.0;
@@ -667,24 +743,22 @@ private:
             p.x = p_world.x; p.y = p_world.y; p.z = z_height_;
             marker.points.push_back(p);
         }
-
-        debug_segment_pub_->publish(marker);
+        return marker;
     }
 
-    template <typename PubT>
-    void deleteMarker(const PubT& pub, const std::string& ns,
-                      const std::string& frame_id, const rclcpp::Time& stamp)
+    visualization_msgs::msg::Marker deleteMarker(const std::string& ns, int id,
+                                                 const rclcpp::Time& stamp) const
     {
         visualization_msgs::msg::Marker m;
         m.header.stamp = stamp;
-        m.header.frame_id = frame_id;
+        m.header.frame_id = output_frame_;
         m.ns = ns;
-        m.id = 0;
+        m.id = id;
         m.action = visualization_msgs::msg::Marker::DELETE;
-        pub->publish(m);
+        return m;
     }
 
-    void clearPublishedPrediction(const rclcpp::Time& stamp)
+    void clearPrimaryOutputs(const rclcpp::Time& stamp)
     {
         nav_msgs::msg::Path empty_path;
         empty_path.header.stamp = stamp;
@@ -694,121 +768,382 @@ private:
         sensor_msgs::msg::PointCloud empty_cloud;
         empty_cloud.header = empty_path.header;
         predicted_cloud_pub_->publish(empty_cloud);
-
-        deleteMarker(predicted_marker_pub_, "predicted_obstacle", output_frame_, stamp);
-        deleteMarker(velocity_marker_pub_, "predicted_obstacle_velocity", output_frame_, stamp);
-        deleteMarker(debug_segment_pub_, "predicted_obstacle_debug_segment", output_frame_, stamp);
     }
 
-    // ---- missing detection handler ----------------------------------
+    // ---- per-track missing-detection / expiry ------------------------
 
-    void handleMissingDetection(const rclcpp::Time& stamp, const std::string& reason)
+    enum class MissingOutcome { DEAD_RECKONED, EXPIRED };
+
+    MissingOutcome handleTrackMissing(Track& t, const rclcpp::Time& stamp, Point2D& out_origin)
     {
-        if (!has_track_)
-        {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "%s", reason.c_str());
-            clearPublishedPrediction(stamp);
-            return;
-        }
-
-        const double dt = (stamp - last_track_stamp_).seconds();
+        const double dt = (stamp - t.last_stamp).seconds();
         const double allowed = std::max(track_timeout_, lost_track_prediction_time_);
 
         if (dt < 0.0 || dt > allowed)
-        {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "%s, track expired", reason.c_str());
-            resetTrack();
-            clearPublishedPrediction(stamp);
-            return;
-        }
+            return MissingOutcome::EXPIRED;
 
-        Point2D predicted_origin;
-        predicted_origin.x = tracked_position_.x + vx_ * dt;
-        predicted_origin.y = tracked_position_.y + vy_ * dt;
+        out_origin.x = t.position.x + t.vx * dt;
+        out_origin.y = t.position.y + t.vy * dt;
 
         const double horizon = std::max(prediction_dt_, prediction_time_);
         if (horizon <= 1e-4)
+            return MissingOutcome::EXPIRED;
+
+        return MissingOutcome::DEAD_RECKONED;
+    }
+
+    // ---- new-track spawning -------------------------------------------
+
+    void spawnNewTracks(const std::vector<Segment>& segments,
+                        const Assignment& assignment,
+                        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg,
+                        const rclcpp::Time& stamp,
+                        visualization_msgs::msg::MarkerArray& debug_array)
+    {
+        std::vector<std::size_t> unmatched;
+        for (std::size_t j = 0; j < segments.size(); ++j)
+            if (!assignment.segment_used[j])
+                unmatched.push_back(j);
+
+        const int capacity = max_tracks_ - static_cast<int>(tracks_.size());
+        if (capacity <= 0 || unmatched.empty()) return;
+
+        if (static_cast<int>(unmatched.size()) > capacity)
         {
-            resetTrack();
-            clearPublishedPrediction(stamp);
-            return;
+            std::sort(unmatched.begin(), unmatched.end(),
+                      [&](std::size_t a, std::size_t b) {
+                          const double da = segments[a].mean_angle - initial_expected_angle_;
+                          const double dr = segments[a].mean_range - initial_expected_range_;
+                          const double db = segments[b].mean_angle - initial_expected_angle_;
+                          const double dr2 = segments[b].mean_range - initial_expected_range_;
+                          return (da * da + dr * dr) < (db * db + dr2 * dr2);
+                      });
+            unmatched.resize(static_cast<std::size_t>(capacity));
         }
 
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "%s, using predicted continuation", reason.c_str());
-        publishPredictionFrom(predicted_origin, stamp, horizon);
+        for (std::size_t j : unmatched)
+        {
+            Point2D center_laser;
+            estimateSegmentCenterLaser(segments[j], cloud_msg->header.frame_id, stamp, center_laser, nullptr);
+            Point2D center_world;
+            if (!laserPointToWorld(center_laser, cloud_msg->header.frame_id, stamp, center_world))
+                continue;
+
+            Track& t = spawnTrack(center_world, stamp);
+            t.last_range = segments[j].mean_range;
+            t.matched_this_cycle = true;
+            debug_array.markers.push_back(debugSegmentMarkerFor(
+                segments[j], cloud_msg->header.frame_id, stamp, t.id));
+        }
     }
 
     // ---- main callback ---------------------------------------------
 
-    void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg)
+    void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg)
     {
-        const rclcpp::Time stamp(scan_msg->header.stamp);
-        const auto valid_pts = extractValidPoints(scan_msg);
+        const rclcpp::Time stamp(cloud_msg->header.stamp);
+        const auto valid_pts = extractValidPointsFromCloud(cloud_msg);
         if (valid_pts.empty())
         {
-            handleMissingDetection(stamp, "No valid scan points after ROI filtering");
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                "No valid obstacle cloud points after ROI filtering");
+            handleAllTracksMissing(stamp);
             return;
         }
 
         const auto segments = buildSegments(valid_pts);
         if (segments.empty())
         {
-            handleMissingDetection(stamp, "No valid scan segments");
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "No valid obstacle segments");
+            handleAllTracksMissing(stamp);
             return;
         }
 
-        Segment selected;
-        Point2D measurement_world;
-        if (!selectSegment(segments, scan_msg, selected, measurement_world))
+        const Assignment assignment = assignSegmentsToTracks(segments, cloud_msg, stamp);
+
+        std_msgs::msg::Header header;
+        header.stamp = stamp;
+        header.frame_id = output_frame_;
+
+        visualization_msgs::msg::MarkerArray debug_array;
+        for (auto& t : tracks_)
         {
-            handleMissingDetection(stamp, "No segment selected");
-            return;
+            t.matched_this_cycle = false;
+            t.pending_dead_reckon = false;
         }
 
-        publishDebugSegment(selected, scan_msg->header.frame_id, stamp);
-        publishDetectedPose(measurement_world, stamp);
-
-        if (!has_track_)
+        // 1) Matched tracks: update or (if stale) re-init in place.
+        for (std::size_t i = 0; i < tracks_.size(); ++i)
         {
-            initializeTrack(measurement_world, stamp);
-            publishPrediction(stamp, prediction_time_);
-            return;
+            const int seg_idx = assignment.track_to_segment[i];
+            if (seg_idx < 0) continue;
+
+            Track& t = tracks_[i];
+            t.matched_this_cycle = true;
+            t.last_range = segments[static_cast<std::size_t>(seg_idx)].mean_range;
+            const Point2D measurement_world = assignment.track_measurement_world[i];
+
+            debug_array.markers.push_back(debugSegmentMarkerFor(
+                segments[static_cast<std::size_t>(seg_idx)], cloud_msg->header.frame_id, stamp, t.id));
+
+            const double dt = (stamp - t.last_stamp).seconds();
+            if (dt < 0.0 || dt > track_timeout_)
+            {
+                reinitTrackInPlace(t, measurement_world, stamp);
+            }
+            else if (dt < 1e-4)
+            {
+                // duplicate timestamp: skip the filter update this cycle
+            }
+            else
+            {
+                updateTrack(t, measurement_world, dt);
+                t.last_stamp = stamp;
+                refreshHeldVelocity(t, stamp);
+            }
         }
 
-        const double dt = (stamp - last_track_stamp_).seconds();
-        if (dt < 0.0 || dt > track_timeout_)
+        // 2) Unmatched existing tracks: dead-reckon or expire. Dead-reckon
+        //    state is stored on the Track itself (not a parallel array) so
+        //    it survives the erase()/spawn() index churn below.
+        std::vector<int> expired_ids;
+        for (std::size_t i = 0; i < tracks_.size(); ++i)
         {
-            initializeTrack(measurement_world, stamp);
-            publishPrediction(stamp, prediction_time_);
-            return;
+            if (assignment.track_to_segment[i] >= 0) continue;
+
+            Point2D origin;
+            const MissingOutcome outcome = handleTrackMissing(tracks_[i], stamp, origin);
+            if (outcome == MissingOutcome::EXPIRED)
+            {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                    "Track %d expired", tracks_[i].id);
+                expired_ids.push_back(tracks_[i].id);
+            }
+            else
+            {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                    "Track %d missing, using predicted continuation", tracks_[i].id);
+                tracks_[i].dead_reckon_origin = origin;
+                tracks_[i].pending_dead_reckon = true;
+            }
         }
 
-        if (dt < 1e-4)
+        // Erase expired tracks (reverse order to keep indices valid).
+        for (int id : expired_ids)
         {
-            publishPrediction(stamp, prediction_time_);
+            tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
+                                         [id](const Track& t) { return t.id == id; }),
+                          tracks_.end());
+        }
+
+        // 3) Spawn new tracks from unmatched segments (respecting max_tracks_).
+        spawnNewTracks(segments, assignment, cloud_msg, stamp, debug_array);
+
+        // 4) Build predictions for every remaining track, aggregate into
+        //    MarkerArrays, pick the primary (closest last-matched-range)
+        //    track for the backward-compatible singular topics.
+        visualization_msgs::msg::MarkerArray marker_array;
+        visualization_msgs::msg::MarkerArray velocity_array;
+        double best_range = std::numeric_limits<double>::infinity();
+        bool have_primary = false;
+        TrackPrediction primary_pred;
+        Point2D primary_measurement{0.0, 0.0};
+        bool primary_matched_this_cycle = false;
+
+        for (std::size_t i = 0; i < tracks_.size(); ++i)
+        {
+            Track& t = tracks_[i];
+            const Point2D origin = t.pending_dead_reckon ? t.dead_reckon_origin : t.position;
+            const double horizon = t.pending_dead_reckon
+                ? std::max(prediction_dt_, prediction_time_)
+                : prediction_time_;
+
+            TrackPrediction pred = buildTrackPrediction(t, origin, stamp, horizon, header);
+
+            if (pred.dynamic)
+            {
+                marker_array.markers.push_back(lineStripMarkerFor(pred, header, t.id));
+                velocity_array.markers.push_back(velocityMarkerFor(pred, stamp, t.id));
+            }
+            else
+            {
+                marker_array.markers.push_back(deleteMarker("predicted_obstacle", t.id, stamp));
+                velocity_array.markers.push_back(deleteMarker("predicted_obstacle_velocity", t.id, stamp));
+            }
+
+            if (pred.dynamic && t.last_range < best_range)
+            {
+                best_range = t.last_range;
+                have_primary = true;
+                primary_pred = pred;
+                primary_measurement = assignment.track_to_segment[i] >= 0
+                    ? assignment.track_measurement_world[i] : origin;
+                primary_matched_this_cycle = t.matched_this_cycle;
+            }
+        }
+
+        for (int id : expired_ids)
+        {
+            marker_array.markers.push_back(deleteMarker("predicted_obstacle", id, stamp));
+            velocity_array.markers.push_back(deleteMarker("predicted_obstacle_velocity", id, stamp));
+            debug_array.markers.push_back(deleteMarker("predicted_obstacle_debug_segment", id, stamp));
+        }
+
+        if (publish_debug_segment_)
+            debug_segment_pub_->publish(debug_array);
+        predicted_marker_pub_->publish(marker_array);
+        velocity_marker_pub_->publish(velocity_array);
+
+        if (have_primary)
+        {
+            nav_msgs::msg::Path path;
+            path.header = header;
+            path.poses = primary_pred.poses;
+            predicted_path_pub_->publish(path);
+
+            sensor_msgs::msg::PointCloud cloud;
+            cloud.header = header;
+            double last_x = primary_pred.origin.x, last_y = primary_pred.origin.y, last_z = z_height_;
+            for (const auto& pose : primary_pred.poses)
+            {
+                addDenseSegment(cloud, last_x, last_y, last_z,
+                               pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
+                last_x = pose.pose.position.x;
+                last_y = pose.pose.position.y;
+                last_z = pose.pose.position.z;
+            }
+            predicted_cloud_pub_->publish(cloud);
+
+            if (primary_matched_this_cycle)
+                publishDetectedPose(primary_measurement, stamp);
+        }
+        else
+        {
+            clearPrimaryOutputs(stamp);
+        }
+    }
+
+    void handleAllTracksMissing(const rclcpp::Time& stamp)
+    {
+        std::vector<int> expired_ids;
+        for (auto& t : tracks_)
+        {
+            Point2D origin;
+            if (handleTrackMissing(t, stamp, origin) == MissingOutcome::EXPIRED)
+                expired_ids.push_back(t.id);
+        }
+        for (int id : expired_ids)
+        {
+            tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
+                                         [id](const Track& t) { return t.id == id; }),
+                          tracks_.end());
+        }
+
+        // Always clear markers for every id that expired this cycle, on all
+        // three MarkerArray topics with their correct namespaces, regardless
+        // of whether any other track survives.
+        visualization_msgs::msg::MarkerArray expired_markers;
+        visualization_msgs::msg::MarkerArray expired_velocity;
+        visualization_msgs::msg::MarkerArray expired_debug;
+        for (int id : expired_ids)
+        {
+            expired_markers.markers.push_back(deleteMarker("predicted_obstacle", id, stamp));
+            expired_velocity.markers.push_back(deleteMarker("predicted_obstacle_velocity", id, stamp));
+            expired_debug.markers.push_back(deleteMarker("predicted_obstacle_debug_segment", id, stamp));
+        }
+
+        if (tracks_.empty())
+        {
+            clearPrimaryOutputs(stamp);
+            predicted_marker_pub_->publish(expired_markers);
+            velocity_marker_pub_->publish(expired_velocity);
+            if (publish_debug_segment_)
+                debug_segment_pub_->publish(expired_debug);
             return;
         }
 
-        updateTrack(measurement_world, dt);
-        last_track_stamp_ = stamp;
-        refreshHeldVelocity(stamp);
-        publishPrediction(stamp, prediction_time_);
+        // Tracks remain (within timeout) but no scan data at all this cycle:
+        // dead-reckon every remaining track the same way scanCallback would.
+        std_msgs::msg::Header header;
+        header.stamp = stamp;
+        header.frame_id = output_frame_;
+
+        visualization_msgs::msg::MarkerArray marker_array = expired_markers;
+        visualization_msgs::msg::MarkerArray velocity_array = expired_velocity;
+        double best_range = std::numeric_limits<double>::infinity();
+        bool have_primary = false;
+        TrackPrediction primary_pred;
+
+        for (auto& t : tracks_)
+        {
+            Point2D origin;
+            handleTrackMissing(t, stamp, origin);
+            const double horizon = std::max(prediction_dt_, prediction_time_);
+            TrackPrediction pred = buildTrackPrediction(t, origin, stamp, horizon, header);
+
+            if (pred.dynamic)
+            {
+                marker_array.markers.push_back(lineStripMarkerFor(pred, header, t.id));
+                velocity_array.markers.push_back(velocityMarkerFor(pred, stamp, t.id));
+                if (t.last_range < best_range)
+                {
+                    best_range = t.last_range;
+                    have_primary = true;
+                    primary_pred = pred;
+                }
+            }
+            else
+            {
+                marker_array.markers.push_back(deleteMarker("predicted_obstacle", t.id, stamp));
+                velocity_array.markers.push_back(deleteMarker("predicted_obstacle_velocity", t.id, stamp));
+            }
+        }
+
+        predicted_marker_pub_->publish(marker_array);
+        velocity_marker_pub_->publish(velocity_array);
+        if (publish_debug_segment_)
+            debug_segment_pub_->publish(expired_debug);
+
+        if (have_primary)
+        {
+            nav_msgs::msg::Path path;
+            path.header = header;
+            path.poses = primary_pred.poses;
+            predicted_path_pub_->publish(path);
+
+            sensor_msgs::msg::PointCloud cloud;
+            cloud.header = header;
+            double last_x = primary_pred.origin.x, last_y = primary_pred.origin.y, last_z = z_height_;
+            for (const auto& pose : primary_pred.poses)
+            {
+                addDenseSegment(cloud, last_x, last_y, last_z,
+                               pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
+                last_x = pose.pose.position.x;
+                last_y = pose.pose.position.y;
+                last_z = pose.pose.position.z;
+            }
+            predicted_cloud_pub_->publish(cloud);
+        }
+        else
+        {
+            clearPrimaryOutputs(stamp);
+        }
     }
 
     // ---- members ----------------------------------------------------
 
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr obstacle_cloud_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr detected_pose_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predicted_path_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr predicted_cloud_pub_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr predicted_marker_pub_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr debug_segment_pub_;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr velocity_marker_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr predicted_marker_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_segment_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr velocity_marker_pub_;
 
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    std::string scan_topic_;
+    std::string obstacle_cloud_topic_;
     std::string output_frame_;
 
     double prediction_time_;
@@ -822,11 +1157,11 @@ private:
     double prediction_hold_speed_epsilon_;
     double min_dynamic_speed_;
     double min_dynamic_persist_;
-    rclcpp::Time dynamic_streak_start_{0, 0, RCL_ROS_TIME};
 
     double point_spacing_;
     double corridor_radius_;
     double object_half_extent_;
+    double center_side_hysteresis_;
     double z_height_;
 
     double scan_range_min_use_;
@@ -848,16 +1183,10 @@ private:
     double initial_expected_range_;
     double max_association_distance_;
     bool publish_debug_segment_;
+    int max_tracks_;
 
-    bool has_track_{false};
-    rclcpp::Time last_track_stamp_{0, 0, RCL_ROS_TIME};
-    Point2D tracked_position_{0.0, 0.0};
-    double vx_{0.0};
-    double vy_{0.0};
-    bool has_held_velocity_{false};
-    rclcpp::Time held_velocity_stamp_{0, 0, RCL_ROS_TIME};
-    double held_vx_{0.0};
-    double held_vy_{0.0};
+    std::vector<Track> tracks_;
+    int next_track_id_{0};
 };
 
 int main(int argc, char** argv)

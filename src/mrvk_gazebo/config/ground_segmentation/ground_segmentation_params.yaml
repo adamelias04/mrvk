@@ -1,0 +1,31 @@
+ground_segmentation:
+  ros__parameters:
+    # pre/post processing
+    robot_frame: "base_link"
+    maxX: 15.0
+    minX: -15.0
+    maxY: 15.0
+    minY: -15.0
+    maxZ: 2.5
+    minZ: -1.0
+    downsample: false
+    downsample_resolution: 0.1
+    # lidar_frame is 0.293825 m above the ground:
+    # base_link is 0.165 m above ground (wheel_radius 0.115 + SHAFT_Z 0.05),
+    # lidar_frame is 0.128825 m above base_link -> 0.165 + 0.128825 = 0.293825
+    lidar_to_ground: -0.293825
+    transform_tolerance: 0.1
+
+    ##ground detection
+    cellSizeX: 1.0
+    cellSizeY: 1.0
+    cellSizeZ: 10.0
+    cellSizeZPhase2: 1.0
+    slopeThresholdDegrees: 20.0
+    groundInlierThreshold: 0.1
+    centroidSearchRadius: 5.0
+    use_imu_orientation: false
+    maxGroundHeightDeviation: 0.1
+
+    #debug
+    show_benchmark: false

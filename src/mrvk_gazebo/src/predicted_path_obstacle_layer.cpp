@@ -12,8 +12,7 @@ namespace mrvk_gazebo
 {
 
 PredictedPathObstacleLayer::PredictedPathObstacleLayer()
-  : has_path_(false),
-    robot_x_(0.0),
+  : robot_x_(0.0),
     robot_y_(0.0),
     has_robot_pose_(false),
     obstacle_radius_(0.25),
@@ -33,7 +32,7 @@ void PredictedPathObstacleLayer::onInitialize()
   current_ = true;
 
   declareParameter("enabled", rclcpp::ParameterValue(true));
-  declareParameter("path_topic", rclcpp::ParameterValue(std::string("/predicted_obstacle_path")));
+  declareParameter("path_topic", rclcpp::ParameterValue(std::string("/predicted_obstacle_markers")));
   declareParameter("obstacle_radius", rclcpp::ParameterValue(0.25));
   declareParameter("max_path_length", rclcpp::ParameterValue(3.0));
   declareParameter("robot_exclusion_radius", rclcpp::ParameterValue(0.55));
@@ -52,9 +51,9 @@ void PredictedPathObstacleLayer::onInitialize()
                          static_cast<int>(nav2_costmap_2d::LETHAL_OBSTACLE));
 
   rclcpp::QoS qos(1);
-  path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
+  marker_sub_ = node->create_subscription<visualization_msgs::msg::MarkerArray>(
       path_topic_, qos,
-      std::bind(&PredictedPathObstacleLayer::pathCallback, this, std::placeholders::_1));
+      std::bind(&PredictedPathObstacleLayer::markerArrayCallback, this, std::placeholders::_1));
 
   RCLCPP_INFO(node->get_logger(),
               "PredictedPathObstacleLayer initialised (topic=%s radius=%.2f max_len=%.2f excl=%.2f)",
@@ -65,41 +64,55 @@ void PredictedPathObstacleLayer::onInitialize()
 void PredictedPathObstacleLayer::reset()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  has_path_ = false;
-  latest_path_.poses.clear();
+  tracked_paths_.clear();
 }
 
-void PredictedPathObstacleLayer::pathCallback(const nav_msgs::msg::Path::ConstSharedPtr msg)
+void PredictedPathObstacleLayer::markerArrayCallback(
+    const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  latest_path_ = *msg;
-  has_path_ = !latest_path_.poses.empty();
-}
+  for (const auto& marker : msg->markers)
+  {
+    if (marker.action == visualization_msgs::msg::Marker::DELETEALL)
+    {
+      tracked_paths_.clear();
+      continue;
+    }
+    if (marker.action == visualization_msgs::msg::Marker::DELETE)
+    {
+      tracked_paths_.erase(marker.id);
+      continue;
+    }
 
-bool PredictedPathObstacleLayer::hasFreshPath(const rclcpp::Time& now) const
-{
-  if (!has_path_) return false;
-  const rclcpp::Time stamp(latest_path_.header.stamp);
-  if (stamp.nanoseconds() == 0) return false;
-  const double age = (now - stamp).seconds();
-  return age >= 0.0 && age <= path_staleness_tolerance_;
+    if (marker.points.empty())
+    {
+      tracked_paths_.erase(marker.id);
+      continue;
+    }
+
+    TrackedPath tp;
+    tp.points.reserve(marker.points.size());
+    for (const auto& pt : marker.points)
+      tp.points.push_back(Point2D{pt.x, pt.y});
+    tp.stamp = rclcpp::Time(marker.header.stamp);
+
+    tracked_paths_[marker.id] = std::move(tp);
+  }
 }
 
 std::vector<PredictedPathObstacleLayer::Point2D>
-PredictedPathObstacleLayer::buildTruncatedPath() const
+PredictedPathObstacleLayer::truncatePath(const std::vector<Point2D>& raw) const
 {
   std::vector<Point2D> pts;
-  if (!has_path_ || latest_path_.poses.empty()) return pts;
+  if (raw.empty()) return pts;
 
-  pts.reserve(latest_path_.poses.size());
+  pts.reserve(raw.size());
   double accumulated = 0.0;
   bool has_prev = false;
   Point2D prev{0.0, 0.0};
 
-  for (const auto& pose : latest_path_.poses)
+  for (const auto& cur : raw)
   {
-    Point2D cur{pose.pose.position.x, pose.pose.position.y};
-
     if (!has_prev)
     {
       pts.push_back(cur);
@@ -136,6 +149,25 @@ PredictedPathObstacleLayer::buildTruncatedPath() const
   return pts;
 }
 
+std::vector<std::vector<PredictedPathObstacleLayer::Point2D>>
+PredictedPathObstacleLayer::buildTruncatedPaths(const rclcpp::Time& now) const
+{
+  std::vector<std::vector<Point2D>> paths;
+  paths.reserve(tracked_paths_.size());
+
+  for (const auto& [id, tp] : tracked_paths_)
+  {
+    if (tp.stamp.nanoseconds() == 0) continue;
+    const double age = (now - tp.stamp).seconds();
+    if (age < 0.0 || age > path_staleness_tolerance_) continue;
+
+    auto truncated = truncatePath(tp.points);
+    if (truncated.size() >= 2) paths.push_back(std::move(truncated));
+  }
+
+  return paths;
+}
+
 void PredictedPathObstacleLayer::updateBounds(double robot_x, double robot_y,
                                               double /*robot_yaw*/,
                                               double* min_x, double* min_y,
@@ -150,14 +182,14 @@ void PredictedPathObstacleLayer::updateBounds(double robot_x, double robot_y,
 
   auto node = node_.lock();
   if (!node) return;
-  if (!hasFreshPath(node->now())) return;
 
-  const auto path = buildTruncatedPath();
-  if (path.size() < 2) return;
+  const auto paths = buildTruncatedPaths(node->now());
+  if (paths.empty()) return;
 
   const double pad = obstacle_radius_ + 0.1;
-  for (const auto& p : path)
-    expandBounds(min_x, min_y, max_x, max_y, p.x, p.y, pad);
+  for (const auto& path : paths)
+    for (const auto& p : path)
+      expandBounds(min_x, min_y, max_x, max_y, p.x, p.y, pad);
 }
 
 void PredictedPathObstacleLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_grid,
@@ -169,10 +201,9 @@ void PredictedPathObstacleLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_
 
   auto node = node_.lock();
   if (!node) return;
-  if (!hasFreshPath(node->now())) return;
 
-  const auto path = buildTruncatedPath();
-  if (path.size() < 2) return;
+  const auto paths = buildTruncatedPaths(node->now());
+  if (paths.empty()) return;
 
   const double rad2 = obstacle_radius_ * obstacle_radius_;
   const double excl2 = robot_exclusion_radius_ * robot_exclusion_radius_;
@@ -195,12 +226,16 @@ void PredictedPathObstacleLayer::updateCosts(nav2_costmap_2d::Costmap2D& master_
       }
 
       double best = std::numeric_limits<double>::infinity();
-      for (std::size_t k = 1; k < path.size(); ++k)
+      for (const auto& path : paths)
       {
-        const double d2 = pointToSegmentDistSq(wx, wy,
-                                               path[k - 1].x, path[k - 1].y,
-                                               path[k].x, path[k].y);
-        if (d2 < best) best = d2;
+        for (std::size_t k = 1; k < path.size(); ++k)
+        {
+          const double d2 = pointToSegmentDistSq(wx, wy,
+                                                 path[k - 1].x, path[k - 1].y,
+                                                 path[k].x, path[k].y);
+          if (d2 < best) best = d2;
+          if (best < 1e-9) break;
+        }
         if (best < 1e-9) break;
       }
 

@@ -39,13 +39,13 @@
         parent="base_link"/>
     
     <!-- IMU -->
-    <xacro:imu_macro name="imu_link" xyz="0.0 0.0 0.0" parent="base_link"/>
-    
+    <xacro:imu_macro name="imu_frame" xyz="0.152755 -0.02226 0.158525" parent="base_link"/>
+
     <!-- LIDAR -->
-    <xacro:lidar_macro name="sensor_laser_link" parent="base_link"/>
-    
+    <xacro:lidar_macro name="lidar_frame" parent="base_link"/>
+
     <!-- Camera -->
-    <xacro:camera_macro name="camera_link" parent="base_link"/>  
+    <xacro:camera_macro name="camera_frame" parent="base_link"/>
         
     <!-- Ultrasonic sensors -->
     <xacro:ultrasonic_sensor_macro

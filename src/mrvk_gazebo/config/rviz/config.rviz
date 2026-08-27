@@ -5,7 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 662
+    Tree Height: 646
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -119,6 +119,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        camera_frame:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         camera_holder_left_1_link:
           Alpha: 1
           Show Axes: false
@@ -159,11 +164,6 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        camera_link:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         holder_front_left_link:
           Alpha: 1
           Show Axes: false
@@ -184,12 +184,12 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        imu_link:
+        imu_frame:
           Alpha: 1
           Show Axes: false
           Show Trail: false
           Value: true
-        sensor_laser_link:
+        lidar_frame:
           Alpha: 1
           Show Axes: false
           Show Trail: false
@@ -277,9 +277,9 @@ Visualization Manager:
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: -999999
+      Max Intensity: 0
       Min Color: 0; 0; 0
-      Min Intensity: 999999
+      Min Intensity: 0
       Name: LaserScan
       Position Transformer: XYZ
       Selectable: true
@@ -472,7 +472,7 @@ Visualization Manager:
         Value: /traveled_path
       Value: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: PredictionMarkers
       Namespaces:
         {}
@@ -482,20 +482,43 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /robot_motion_prediction_marker
-      Value: true
-    - Class: rviz_default_plugins/Marker
-      Enabled: true
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
       Name: ObstacleMarkers
       Namespaces:
-        predicted_obstacle: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
-        Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /predicted_obstacle_markers
-      Value: true
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: ObstacleDebugSegments
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /predicted_obstacle_debug_segment
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: ObstacleVelocityMarkers
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /predicted_obstacle_velocity_marker
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -551,12 +574,12 @@ Visualization Manager:
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1402
+  Height: 1376
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000015600000520fc0200000002fb000000100044006900730070006c006100790073010000003d00000319000000c900fffffffb0000000a00560069006500770073010000035c00000201000000a400ffffff0000041c0000052000000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000015600000506fc0200000002fb000000100044006900730070006c006100790073010000003d00000309000000c900fffffffb0000000a00560069006500770073010000034c000001f7000000a400ffffff0000041c0000050600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
   Width: 1400
   X: 1160
-  Y: 0
+  Y: 27

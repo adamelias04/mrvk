@@ -317,8 +317,8 @@
         <xacro:lens_macro name="${name}"
                           radius="${lens_radius}"
                           length="${lens_length}"
-                          xyz="${lens_x} ${lens_y} ${lens_z}"
-                          rpy="0.0 ${pitch} 0.0"
+                          xyz="0.167663 0.0 0.194112"
+                          rpy="-1.8288456 0.0022189 -1.5752228"
                           parent="${parent}"/>
         <!-- ========================================================= Links -->
     </xacro:macro>

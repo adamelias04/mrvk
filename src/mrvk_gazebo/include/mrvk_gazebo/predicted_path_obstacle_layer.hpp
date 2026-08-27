@@ -1,6 +1,7 @@
 #ifndef MRVK_GAZEBO__PREDICTED_PATH_OBSTACLE_LAYER_HPP_
 #define MRVK_GAZEBO__PREDICTED_PATH_OBSTACLE_LAYER_HPP_
 
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -8,15 +9,18 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav2_costmap_2d/layer.hpp>
 #include <nav2_costmap_2d/layered_costmap.hpp>
-#include <nav_msgs/msg/path.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 namespace mrvk_gazebo
 {
 
-// ROS2 / Nav2 port. Stamps LETHAL cells along /predicted_obstacle_path
+// ROS2 / Nav2 port. Stamps LETHAL cells along every currently active
+// predicted-obstacle track (read from /predicted_obstacle_markers, a
+// MarkerArray with one LINE_STRIP per tracked object, keyed by marker id)
 // directly into the master grid in updateCosts. No persistence: every
-// costmap update cycle recomputes from the current path, so stale predictions
-// disappear once the publisher sends a new one (or stops publishing).
+// costmap update cycle recomputes from the current marker set, and DELETE
+// actions remove a track's path immediately, so stale predictions disappear
+// once the publisher stops including that id (or sends a DELETE).
 class PredictedPathObstacleLayer : public nav2_costmap_2d::Layer
 {
 public:
@@ -38,10 +42,16 @@ private:
     double y;
   };
 
-  void pathCallback(const nav_msgs::msg::Path::ConstSharedPtr msg);
+  struct TrackedPath
+  {
+    std::vector<Point2D> points;
+    rclcpp::Time stamp;
+  };
 
-  std::vector<Point2D> buildTruncatedPath() const;
-  bool hasFreshPath(const rclcpp::Time& now) const;
+  void markerArrayCallback(const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg);
+
+  std::vector<std::vector<Point2D>> buildTruncatedPaths(const rclcpp::Time& now) const;
+  std::vector<Point2D> truncatePath(const std::vector<Point2D>& raw) const;
 
   double pointToSegmentDistSq(double px, double py,
                               double x0, double y0,
@@ -53,10 +63,9 @@ private:
 
   std::mutex mutex_;
 
-  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr marker_sub_;
 
-  nav_msgs::msg::Path latest_path_;
-  bool has_path_;
+  std::map<int, TrackedPath> tracked_paths_;
 
   double robot_x_;
   double robot_y_;

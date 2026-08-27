@@ -119,14 +119,14 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: true
-      update_frequency: 10.0
-      publish_frequency: 10.0
+      update_frequency: 20.0
+      publish_frequency: 20.0
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 9
-      height: 9
-      resolution: 0.1
+      width: 20
+      height: 20
+      resolution: 0.05
       robot_radius: 0.28
       transform_tolerance: 0.2
       track_unknown_space: false
@@ -138,24 +138,24 @@ local_costmap:
         observation_sources: scan_marking scan_clearing
         scan_marking:
           topic: /scan
-          sensor_frame: sensor_laser_link
+          sensor_frame: lidar_frame
           data_type: "LaserScan"
           marking: true
           clearing: false
           inf_is_valid: false
-          obstacle_max_range: 3.4
-          raytrace_max_range: 3.7
+          obstacle_max_range: 15.0
+          raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
         scan_clearing:
           topic: /scan
-          sensor_frame: sensor_laser_link
+          sensor_frame: lidar_frame
           data_type: "LaserScan"
           marking: false
           clearing: true
           inf_is_valid: true
-          obstacle_max_range: 3.4
-          raytrace_max_range: 7.0
+          obstacle_max_range: 15.0
+          raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
       predicted_path_obstacle_layer:
@@ -163,7 +163,7 @@ local_costmap:
         # DOCASNE vypnute — testujeme len staticku navigaciu. Pri navrate
         # k dynamickym prekazkam zapni spolu so safety_filter:=true.
         enabled: false
-        path_topic: /predicted_obstacle_path
+        path_topic: /predicted_obstacle_markers
         obstacle_radius: 0.25
         max_path_length: 3.0
         robot_exclusion_radius: 0.55
@@ -175,7 +175,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.35
+        inflation_radius: 0.08
         cost_scaling_factor: 6.0
       always_send_full_costmap: True
 
@@ -204,24 +204,24 @@ global_costmap:
         observation_sources: scan_marking scan_clearing
         scan_marking:
           topic: /scan
-          sensor_frame: sensor_laser_link
+          sensor_frame: lidar_frame
           data_type: "LaserScan"
           marking: true
           clearing: false
           inf_is_valid: false
-          obstacle_max_range: 3.4
-          raytrace_max_range: 3.7
+          obstacle_max_range: 15.0
+          raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
         scan_clearing:
           topic: /scan
-          sensor_frame: sensor_laser_link
+          sensor_frame: lidar_frame
           data_type: "LaserScan"
           marking: false
           clearing: true
           inf_is_valid: true
-          obstacle_max_range: 3.4
-          raytrace_max_range: 7.0
+          obstacle_max_range: 15.0
+          raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
       detected_path_layer:
@@ -230,7 +230,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.35
+        inflation_radius: 0.08
         cost_scaling_factor: 6.0
       always_send_full_costmap: True
 
