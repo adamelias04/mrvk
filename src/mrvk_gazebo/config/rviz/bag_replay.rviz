@@ -428,6 +428,18 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
+      Name: RawSegments (pre-tracking, all clusters)
+      Namespaces:
+        raw_segment: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /predicted_obstacle_raw_segments
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
       Name: PredictedPaths
       Namespaces:
         predicted_obstacle: true

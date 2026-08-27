@@ -12,16 +12,17 @@ dynamic_obstacle_predictor:
     prediction_hold_time: 0.8
     prediction_hold_speed_epsilon: 0.08
     min_dynamic_speed: 0.3
-    min_dynamic_persist: 0.2
+    min_dynamic_persist: 0.3
+    dynamic_dip_tolerance: 0.3
     point_spacing: 0.05
     corridor_radius: 0.18
     object_half_extent: 0.18
     center_side_hysteresis: 0.5
     z_height: 0.10
     scan_range_min_use: 0.10
-    scan_range_max_use: 8.00
+    scan_range_max_use: 15.00
     segment_jump_distance: 0.30
-    segment_min_points: 30
+    segment_min_points: 20
     segment_max_points: 600
     segment_min_width: 0.03
     segment_max_width: 2.00

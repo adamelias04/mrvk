@@ -30,6 +30,18 @@
 #include <limits>
 #include <algorithm>
 #include <memory>
+#include <unordered_map>
+#include <cstdint>
+
+// Simple union-find used to merge points into Euclidean-connected clusters
+// (see buildSegments) -- independent of any angular ordering.
+struct DisjointSet
+{
+    std::vector<int> parent;
+    explicit DisjointSet(int n) : parent(n) { for (int i = 0; i < n; ++i) parent[i] = i; }
+    int find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+    void unite(int a, int b) { a = find(a); b = find(b); if (a != b) parent[a] = b; }
+};
 
 struct ScanPoint
 {
@@ -66,6 +78,7 @@ struct Track
     double held_vx{0.0};
     double held_vy{0.0};
     rclcpp::Time dynamic_streak_start{0, 0, RCL_ROS_TIME};
+    rclcpp::Time last_above_threshold_stamp{0, 0, RCL_ROS_TIME};
     double last_range{0.0};
     bool matched_this_cycle{false};
     bool pending_dead_reckon{false};
@@ -116,6 +129,7 @@ private:
         prediction_hold_speed_epsilon_ = declare_parameter<double>("prediction_hold_speed_epsilon", 0.08);
         min_dynamic_speed_ = declare_parameter<double>("min_dynamic_speed", 0.35);
         min_dynamic_persist_ = declare_parameter<double>("min_dynamic_persist", 0.5);
+        dynamic_dip_tolerance_ = declare_parameter<double>("dynamic_dip_tolerance", 0.3);
 
         point_spacing_ = declare_parameter<double>("point_spacing", 0.05);
         corridor_radius_ = declare_parameter<double>("corridor_radius", 0.18);
@@ -158,6 +172,7 @@ private:
         predicted_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_markers", qos);
         debug_segment_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_debug_segment", qos);
         velocity_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_velocity_marker", qos);
+        raw_segments_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/predicted_obstacle_raw_segments", qos);
     }
 
     // ---- track management -------------------------------------------
@@ -171,6 +186,7 @@ private:
         t.vy = 0.0;
         t.last_stamp = stamp;
         t.dynamic_streak_start = zeroTime();
+        t.last_above_threshold_stamp = zeroTime();
         tracks_.push_back(t);
         return tracks_.back();
     }
@@ -186,6 +202,7 @@ private:
         t.held_vx = 0.0;
         t.held_vy = 0.0;
         t.dynamic_streak_start = zeroTime();
+        t.last_above_threshold_stamp = zeroTime();
     }
 
     void updateTrack(Track& t, const Point2D& measurement, double dt)
@@ -345,28 +362,80 @@ private:
         out.push_back(s);
     }
 
+    // Euclidean (radius-connected) clustering over the raw 2D point set,
+    // using a uniform spatial hash grid (cell size = segment_jump_distance_)
+    // for O(N) average neighbor queries and union-find to merge points
+    // within segment_jump_distance_ of each other into one cluster. Replaces
+    // the old angle-sorted 1D jump-distance walk, which assumed a
+    // sequentially-swept LaserScan; on an unordered pointcloud-derived point
+    // set that assumption let spatially close points end up in different
+    // segments (or vice versa) purely because of where they fell in the
+    // angular sort, which was the dominant source of the segment
+    // composition/position instability seen once the predictor moved to
+    // consuming /ground_segmentation/obstacle_points directly.
     std::vector<Segment> buildSegments(const std::vector<ScanPoint>& pts)
     {
         std::vector<Segment> segments;
         if (pts.empty()) return segments;
 
-        std::vector<ScanPoint> current;
-        current.push_back(pts.front());
+        const double cell = std::max(segment_jump_distance_, 1e-3);
+        auto cellIndex = [cell](double v) {
+            return static_cast<int32_t>(std::floor(v / cell));
+        };
+        auto cellKey = [](int32_t cx, int32_t cy) -> int64_t {
+            return (static_cast<int64_t>(cx) << 32) | static_cast<uint32_t>(cy);
+        };
 
-        for (std::size_t i = 1; i < pts.size(); ++i)
+        std::unordered_map<int64_t, std::vector<int>> grid;
+        grid.reserve(pts.size());
+        for (std::size_t i = 0; i < pts.size(); ++i)
         {
-            if (distLaser(pts[i - 1], pts[i]) <= segment_jump_distance_)
+            const int64_t key = cellKey(cellIndex(pts[i].x_laser), cellIndex(pts[i].y_laser));
+            grid[key].push_back(static_cast<int>(i));
+        }
+
+        DisjointSet ds(static_cast<int>(pts.size()));
+        const double jump2 = segment_jump_distance_ * segment_jump_distance_;
+
+        for (std::size_t i = 0; i < pts.size(); ++i)
+        {
+            const int32_t cx = cellIndex(pts[i].x_laser);
+            const int32_t cy = cellIndex(pts[i].y_laser);
+
+            for (int dx = -1; dx <= 1; ++dx)
             {
-                current.push_back(pts[i]);
-            }
-            else
-            {
-                finalizeSegment(current, segments);
-                current.clear();
-                current.push_back(pts[i]);
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    const auto it = grid.find(cellKey(cx + dx, cy + dy));
+                    if (it == grid.end()) continue;
+
+                    for (int j : it->second)
+                    {
+                        if (j <= static_cast<int>(i)) continue;
+                        const double ddx = pts[i].x_laser - pts[j].x_laser;
+                        const double ddy = pts[i].y_laser - pts[j].y_laser;
+                        if (ddx * ddx + ddy * ddy <= jump2)
+                            ds.unite(static_cast<int>(i), j);
+                    }
+                }
             }
         }
-        finalizeSegment(current, segments);
+
+        std::unordered_map<int, std::vector<ScanPoint>> clusters;
+        for (std::size_t i = 0; i < pts.size(); ++i)
+            clusters[ds.find(static_cast<int>(i))].push_back(pts[i]);
+
+        for (auto& entry : clusters)
+        {
+            std::vector<ScanPoint>& cluster_pts = entry.second;
+            // Keep points angle-sorted within each cluster: downstream code
+            // (estimateSegmentCenterLaser) uses the front/back points to
+            // derive a tangent/normal for near-side/far-side disambiguation.
+            std::sort(cluster_pts.begin(), cluster_pts.end(),
+                      [](const ScanPoint& a, const ScanPoint& b) { return a.angle < b.angle; });
+            finalizeSegment(cluster_pts, segments);
+        }
+
         return segments;
     }
 
@@ -643,9 +712,21 @@ private:
 
         if (speedNorm(pred_vx, pred_vy) < min_dynamic_speed_)
         {
-            t.dynamic_streak_start = zeroTime();
+            // A single noisy below-threshold reading shouldn't throw away
+            // an otherwise-real motion streak: the raw per-cycle velocity
+            // estimate straddles min_dynamic_speed_ for a genuinely moving
+            // object often enough that a hard reset-on-any-dip never lets
+            // min_dynamic_persist_ accumulate. Only reset once the object
+            // has been below threshold for longer than the dip tolerance
+            // (i.e. it plausibly stopped, not just one jittery sample).
+            if (isZero(t.last_above_threshold_stamp) ||
+                (stamp - t.last_above_threshold_stamp).seconds() > dynamic_dip_tolerance_)
+            {
+                t.dynamic_streak_start = zeroTime();
+            }
             return result;
         }
+        t.last_above_threshold_stamp = stamp;
         if (isZero(t.dynamic_streak_start))
             t.dynamic_streak_start = stamp;
         if ((stamp - t.dynamic_streak_start).seconds() < min_dynamic_persist_)
@@ -758,6 +839,54 @@ private:
         return m;
     }
 
+    // Every valid cluster straight out of buildSegments, before any track
+    // association or dynamic/static classification. Lets you see
+    // immediately whether an object is being segmented at all (and how
+    // many points / what shape) from the very first frame it enters view,
+    // independent of whether a track ever spawns for it or how long it
+    // takes to be classified as moving -- unlike
+    // /predicted_obstacle_debug_segment, which only ever shows segments
+    // that already got matched to a track.
+    void publishRawSegments(const std::vector<Segment>& segments,
+                            const std::string& cloud_frame,
+                            const rclcpp::Time& stamp)
+    {
+        visualization_msgs::msg::MarkerArray array;
+        for (std::size_t j = 0; j < segments.size(); ++j)
+        {
+            visualization_msgs::msg::Marker marker;
+            marker.header.stamp = stamp;
+            marker.header.frame_id = output_frame_;
+            marker.ns = "raw_segment";
+            marker.id = static_cast<int>(j);
+            marker.type = visualization_msgs::msg::Marker::POINTS;
+            marker.action = visualization_msgs::msg::Marker::ADD;
+            marker.pose.orientation.w = 1.0;
+            marker.scale.x = 0.04;
+            marker.scale.y = 0.04;
+            marker.color.r = 1.0;
+            marker.color.g = 1.0;
+            marker.color.a = 0.8;
+
+            for (const auto& sp : segments[j].points)
+            {
+                Point2D p_world;
+                if (!laserPointToWorld({sp.x_laser, sp.y_laser}, cloud_frame, stamp, p_world))
+                    continue;
+                geometry_msgs::msg::Point p;
+                p.x = p_world.x; p.y = p_world.y; p.z = z_height_;
+                marker.points.push_back(p);
+            }
+            array.markers.push_back(marker);
+        }
+
+        for (std::size_t j = segments.size(); j < last_raw_segment_count_; ++j)
+            array.markers.push_back(deleteMarker("raw_segment", static_cast<int>(j), stamp));
+
+        last_raw_segment_count_ = segments.size();
+        raw_segments_pub_->publish(array);
+    }
+
     void clearPrimaryOutputs(const rclcpp::Time& stamp)
     {
         nav_msgs::msg::Path empty_path;
@@ -852,6 +981,8 @@ private:
         }
 
         const auto segments = buildSegments(valid_pts);
+        publishRawSegments(segments, cloud_msg->header.frame_id, stamp);
+
         if (segments.empty())
         {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "No valid obstacle segments");
@@ -1139,6 +1270,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr predicted_marker_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_segment_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr velocity_marker_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr raw_segments_pub_;
 
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -1157,6 +1289,7 @@ private:
     double prediction_hold_speed_epsilon_;
     double min_dynamic_speed_;
     double min_dynamic_persist_;
+    double dynamic_dip_tolerance_;
 
     double point_spacing_;
     double corridor_radius_;
@@ -1187,6 +1320,7 @@ private:
 
     std::vector<Track> tracks_;
     int next_track_id_{0};
+    std::size_t last_raw_segment_count_{0};
 };
 
 int main(int argc, char** argv)
