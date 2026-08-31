@@ -416,7 +416,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: PredictorSegments (clustered)
+      Name: TrackedSegments (red=stayed put, green=travelling)
       Namespaces:
         predicted_obstacle_debug_segment: true
       Topic:

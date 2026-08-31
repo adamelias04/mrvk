@@ -2,7 +2,16 @@
 // Detects and tracks multiple simultaneous dynamic obstacles from the
 // ground-segmented obstacle point cloud (/ground_segmentation/obstacle_points)
 // using per-object alpha-beta filters (position+velocity) and
-// constant-velocity predictions. Publishes /detected_obstacle_pose and
+// constant-velocity predictions.
+//
+// Whether a track counts as MOVING is decided by whether the ground it
+// covered a moment ago has since cleared -- not by how fast its centroid
+// appears to travel. Only part of a long structure is visible at a time, so
+// the visible slice of a fence really does slide metres along it as the
+// robot drives past, giving textbook moving-object velocity and displacement
+// statistics for something that never moved. Asking what is still standing
+// there cannot be fooled that way, and cut false predictions by ~90% on the
+// jk0009 and pivo0001 recordings. Publishes /detected_obstacle_pose and
 // /predicted_obstacle_path for the single closest ("primary") track only,
 // for backward compatibility with robot_motion_predictor (not yet updated
 // to consume multiple tracks); /predicted_obstacle_markers,
@@ -32,6 +41,7 @@
 #include <memory>
 #include <unordered_map>
 #include <cstdint>
+#include <deque>
 
 // Simple union-find used to merge points into Euclidean-connected clusters
 // (see buildSegments) -- independent of any angular ordering.
@@ -47,9 +57,19 @@ struct ScanPoint
 {
     double x_laser;
     double y_laser;
+    // Same point in the output (odom) frame. Filled once per cycle from a
+    // single TF lookup rather than a per-point transform.
+    double x_world;
+    double y_world;
     double range;
     double angle;
     int index;
+};
+
+struct Point2D
+{
+    double x;
+    double y;
 };
 
 struct Segment
@@ -57,13 +77,58 @@ struct Segment
     std::vector<ScanPoint> points;
     double mean_range;
     double mean_angle;
-    double width;
+    // True spatial size, from the cluster's own principal axes: extent is
+    // the span along the dominant direction, thickness the span across it.
+    // The old measure (chord between the angularly-first and -last point)
+    // collapses to nearly zero for anything oriented radially away from the
+    // sensor, so a 6 m fence pointing away from the robot measured as
+    // "narrow" and sailed through the size filter.
+    double extent;
+    double thickness;
 };
 
-struct Point2D
+// One position sample in the odom frame, used to judge motion over a time
+// window rather than from a single frame-to-frame difference.
+struct MotionSample
 {
-    double x;
-    double y;
+    rclcpp::Time stamp;
+    Point2D pos;
+};
+
+// Planar (z = 0) rigid transform, applied to a whole cloud from a single TF
+// lookup instead of transforming points one at a time.
+struct PlanarTransform
+{
+    double r00{1.0}, r01{0.0}, r10{0.0}, r11{1.0};
+    double tx{0.0}, ty{0.0};
+
+    Point2D apply(double x, double y) const
+    {
+        return {r00 * x + r01 * y + tx, r10 * x + r11 * y + ty};
+    }
+};
+
+// A subsample of the ground a track's cluster covered at one instant, kept
+// in the odom frame so it can be revisited later to ask whether the object
+// is still standing there.
+struct Footprint
+{
+    rclcpp::Time stamp;
+    std::vector<Point2D> pts;
+};
+
+// What a track's recent position history says about whether it is really
+// travelling, as opposed to sitting still and jittering.
+struct MotionEvidence
+{
+    bool valid{false};
+    double vx{0.0};
+    double vy{0.0};
+    double speed{0.0};
+    double net_disp{0.0};    // straight-line start -> end over the window
+    double path_len{0.0};    // summed per-sample motion over the window
+    double straightness{0.0};// net_disp / path_len: ~1 travelling, ~0 jitter
+    double span{0.0};        // seconds actually covered by the history
 };
 
 struct Track
@@ -73,16 +138,32 @@ struct Track
     double vx{0.0};
     double vy{0.0};
     rclcpp::Time last_stamp{0, 0, RCL_ROS_TIME};
-    bool has_held_velocity{false};
-    rclcpp::Time held_velocity_stamp{0, 0, RCL_ROS_TIME};
-    double held_vx{0.0};
-    double held_vy{0.0};
-    rclcpp::Time dynamic_streak_start{0, 0, RCL_ROS_TIME};
-    rclcpp::Time last_above_threshold_stamp{0, 0, RCL_ROS_TIME};
     double last_range{0.0};
     bool matched_this_cycle{false};
     bool pending_dead_reckon{false};
     Point2D dead_reckon_origin{0.0, 0.0};
+    // Recent odom-frame positions, trimmed to motion_window_ seconds.
+    std::deque<MotionSample> motion_history;
+    // Size of the most recently associated cluster, so an object that grows
+    // into infrastructure-sized geometry can be dropped as a mover.
+    double last_extent{0.0};
+    // Where this object's cluster sat over the last couple of seconds, and
+    // how much of the oldest of those footprints is still occupied now.
+    std::deque<Footprint> footprints;
+    double persistence{1.0};
+    bool has_persistence{false};
+    int persistence_samples{0};
+    // How far back the footprint behind the current verdict reaches. A
+    // verdict from a short lookback is only trusted when it is emphatic.
+    double persistence_age{0.0};
+    int static_evidence{0};
+    // Whether this object has been shown to be part of the scenery. Latched
+    // rather than re-decided every cycle: what a thing IS does not flicker,
+    // and a per-cycle test leaks a prediction on every noisy dip.
+    bool confirmed_static{false};
+    // Latest window statistics, computed once per cycle and reused by both
+    // the classifier and the diagnostic markers.
+    MotionEvidence evidence;
 };
 
 class DynamicObstaclePredictor : public rclcpp::Node
@@ -125,11 +206,26 @@ private:
         max_speed_ = declare_parameter<double>("max_speed", 2.0);
         track_timeout_ = declare_parameter<double>("track_timeout", 0.8);
         lost_track_prediction_time_ = declare_parameter<double>("lost_track_prediction_time", 1.0);
-        prediction_hold_time_ = declare_parameter<double>("prediction_hold_time", 0.8);
-        prediction_hold_speed_epsilon_ = declare_parameter<double>("prediction_hold_speed_epsilon", 0.08);
         min_dynamic_speed_ = declare_parameter<double>("min_dynamic_speed", 0.35);
-        min_dynamic_persist_ = declare_parameter<double>("min_dynamic_persist", 0.5);
-        dynamic_dip_tolerance_ = declare_parameter<double>("dynamic_dip_tolerance", 0.3);
+
+        // How the footprint (still-there?) test is run and judged.
+        occupancy_match_radius_ = declare_parameter<double>("occupancy_match_radius", 0.35);
+        occupancy_support_count_ = declare_parameter<int>("occupancy_support_count", 3);
+        persistence_delay_ = declare_parameter<double>("persistence_delay", 1.5);
+        persistence_fast_delay_ = declare_parameter<double>("persistence_fast_delay", 0.7);
+        persistence_keep_extra_ = declare_parameter<double>("persistence_keep_extra", 0.5);
+        persistence_min_points_ = declare_parameter<int>("persistence_min_points", 5);
+        persistence_smoothing_ = declare_parameter<double>("persistence_smoothing", 0.35);
+        footprint_points_ = declare_parameter<int>("footprint_points", 24);
+        max_persistence_ = declare_parameter<double>("max_persistence", 0.3);
+        moving_persistence_ = declare_parameter<double>("moving_persistence", 0.2);
+        static_confirm_persistence_ =
+            declare_parameter<double>("static_confirm_persistence", 0.45);
+        static_confirm_samples_ = declare_parameter<int>("static_confirm_samples", 2);
+
+        motion_window_ = declare_parameter<double>("motion_window", 2.0);
+        min_motion_window_ = declare_parameter<double>("min_motion_window", 0.6);
+
 
         point_spacing_ = declare_parameter<double>("point_spacing", 0.05);
         corridor_radius_ = declare_parameter<double>("corridor_radius", 0.18);
@@ -185,8 +281,6 @@ private:
         t.vx = 0.0;
         t.vy = 0.0;
         t.last_stamp = stamp;
-        t.dynamic_streak_start = zeroTime();
-        t.last_above_threshold_stamp = zeroTime();
         tracks_.push_back(t);
         return tracks_.back();
     }
@@ -197,12 +291,10 @@ private:
         t.vx = 0.0;
         t.vy = 0.0;
         t.last_stamp = stamp;
-        t.has_held_velocity = false;
-        t.held_velocity_stamp = zeroTime();
-        t.held_vx = 0.0;
-        t.held_vy = 0.0;
-        t.dynamic_streak_start = zeroTime();
-        t.last_above_threshold_stamp = zeroTime();
+        // A re-init means the association was too stale to trust as the same
+        // object; carrying the old positions over would fabricate a huge
+        // displacement across the gap.
+        t.motion_history.clear();
     }
 
     void updateTrack(Track& t, const Point2D& measurement, double dt)
@@ -234,31 +326,7 @@ private:
         return std::sqrt(vx * vx + vy * vy);
     }
 
-    void refreshHeldVelocity(Track& t, const rclcpp::Time& stamp)
-    {
-        if (speedNorm(t.vx, t.vy) < prediction_hold_speed_epsilon_)
-            return;
-        t.held_vx = t.vx;
-        t.held_vy = t.vy;
-        t.held_velocity_stamp = stamp;
-        t.has_held_velocity = true;
-    }
 
-    void selectPredictionVelocity(const Track& t, const rclcpp::Time& stamp, double& pred_vx, double& pred_vy) const
-    {
-        pred_vx = t.vx;
-        pred_vy = t.vy;
-
-        if (speedNorm(pred_vx, pred_vy) >= prediction_hold_speed_epsilon_)
-            return;
-        if (!t.has_held_velocity || isZero(t.held_velocity_stamp))
-            return;
-        if (std::fabs((stamp - t.held_velocity_stamp).seconds()) > prediction_hold_time_)
-            return;
-
-        pred_vx = t.held_vx;
-        pred_vy = t.held_vy;
-    }
 
     Point2D predictTrackPosition(const Track& t, const rclcpp::Time& stamp) const
     {
@@ -267,6 +335,220 @@ private:
         p.x += t.vx * dt;
         p.y += t.vy * dt;
         return p;
+    }
+
+    // ---- occupancy: is this ground still covered? ---------------------
+
+    static int32_t cellIndexFor(double v, double cell)
+    {
+        return static_cast<int32_t>(std::floor(v / cell));
+    }
+
+    static int64_t cellKeyFor(int32_t cx, int32_t cy)
+    {
+        return (static_cast<int64_t>(cx) << 32) | static_cast<uint32_t>(cy);
+    }
+
+    // Ask the question that actually separates a pedestrian from a hedge:
+    // is the ground the object covered a second or two ago now EMPTY? A
+    // mover has left, so its old footprint clears. A fence has not moved an
+    // inch, so its footprint stays occupied no matter how its visible slice
+    // slid along it or how noisy its centroid looked. Unlike the arrival
+    // test (is it standing where nothing was?), this cannot be fooled by
+    // the scattered background clutter an outdoor scene leaves everywhere.
+    void updatePersistence(Track& t, const rclcpp::Time& stamp)
+    {
+        if (t.footprints.empty()) return;
+
+        // The oldest footprint still held gives the longest lookback and so
+        // the most decisive answer; the deque is trimmed to roughly
+        // persistence_delay_, so it matures to that on its own. Judging from
+        // a shorter lookback early on keeps a genuine mover from being
+        // invisible for the whole delay -- the caller simply demands
+        // stronger clearance from a young verdict.
+        const Footprint& oldest = t.footprints.front();
+        const double age = (stamp - oldest.stamp).seconds();
+        if (age < persistence_fast_delay_) return;
+
+        std::size_t visible = 0, still = 0;
+        for (const auto& p : oldest.pts)
+        {
+            // Absence out of range proves nothing, so only judge ground the
+            // sensor can currently see.
+            const Point2D local = world_to_sensor_.apply(p.x, p.y);
+            if (std::hypot(local.x, local.y) > scan_range_max_use_) continue;
+            ++visible;
+            if (currentCloudOccupied(p)) ++still;
+        }
+
+        if (visible < static_cast<std::size_t>(persistence_min_points_)) return;
+
+        const double value = static_cast<double>(still) /
+                             static_cast<double>(visible);
+        if (!t.has_persistence)
+        {
+            t.persistence = value;
+            t.has_persistence = true;
+        }
+        else
+        {
+            t.persistence += persistence_smoothing_ * (value - t.persistence);
+        }
+        ++t.persistence_samples;
+        t.persistence_age = age;
+
+        // Accumulate a verdict instead of trusting any single cycle: sensor
+        // sparsity makes an individual footprint check noisy, but a fence
+        // reads "still there" over and over while a mover never does.
+        if (value >= static_confirm_persistence_)
+        {
+            if (++t.static_evidence >= static_confirm_samples_)
+                t.confirmed_static = true;
+        }
+        else if (value <= moving_persistence_)
+        {
+            t.static_evidence = 0;
+            t.confirmed_static = false;
+        }
+    }
+
+    bool currentCloudOccupied(const Point2D& p) const
+    {
+        const double r2 = occupancy_match_radius_ * occupancy_match_radius_;
+        const int32_t cx = cellIndexFor(p.x, occupancy_match_radius_);
+        const int32_t cy = cellIndexFor(p.y, occupancy_match_radius_);
+
+        int support = 0;
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                const auto it = current_grid_.find(cellKeyFor(cx + dx, cy + dy));
+                if (it == current_grid_.end()) continue;
+                for (const auto& q : it->second)
+                {
+                    const double ddx = p.x - q.x, ddy = p.y - q.y;
+                    if (ddx * ddx + ddy * ddy <= r2 &&
+                        ++support >= occupancy_support_count_)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    void pushFootprint(Track& t, const Segment& s, const rclcpp::Time& stamp)
+    {
+        Footprint f;
+        f.stamp = stamp;
+        const std::size_t step =
+            std::max<std::size_t>(1, s.points.size() / footprint_points_);
+        for (std::size_t i = 0; i < s.points.size(); i += step)
+            f.pts.push_back(Point2D{s.points[i].x_world, s.points[i].y_world});
+
+        if (!t.footprints.empty() && stamp < t.footprints.back().stamp)
+            t.footprints.clear();
+        t.footprints.push_back(std::move(f));
+
+        while (t.footprints.size() > 1 &&
+               (stamp - t.footprints.front().stamp).seconds() >
+                   persistence_delay_ + persistence_keep_extra_)
+        {
+            t.footprints.pop_front();
+        }
+    }
+
+    void buildCurrentGrid(const std::vector<ScanPoint>& pts)
+    {
+        current_grid_.clear();
+        for (const auto& p : pts)
+        {
+            current_grid_[cellKeyFor(cellIndexFor(p.x_world, occupancy_match_radius_),
+                                     cellIndexFor(p.y_world, occupancy_match_radius_))]
+                .push_back(Point2D{p.x_world, p.y_world});
+        }
+    }
+
+
+    // ---- motion evidence over a time window --------------------------
+
+    void pushMotionSample(Track& t, const Point2D& p, const rclcpp::Time& stamp)
+    {
+        if (!t.motion_history.empty() && stamp < t.motion_history.back().stamp)
+            t.motion_history.clear();   // time jumped backwards (bag looped)
+
+        t.motion_history.push_back(MotionSample{stamp, p});
+        while (t.motion_history.size() > 1 &&
+               (stamp - t.motion_history.front().stamp).seconds() > motion_window_)
+        {
+            t.motion_history.pop_front();
+        }
+    }
+
+    // Judge motion from the whole recent history instead of the alpha-beta
+    // velocity. The alpha-beta estimate differentiates essentially one
+    // measurement pair, so it amplifies position noise by roughly
+    // beta/dt (= 2 per metre at these gains): the ~0.1-0.2 m of frame-to-frame
+    // jitter a partially-observed cluster's position naturally has lands its
+    // apparent speed right on top of min_dynamic_speed_, which is why static
+    // objects kept producing predictions no matter how the threshold moved.
+    // Fitting a line through a window of samples averages that noise down by
+    // roughly sqrt(N), and the two integral measures below are what really
+    // separate the cases: over a couple of seconds a jittering static object
+    // accumulates plenty of path length but almost no net displacement, while
+    // something genuinely travelling accumulates both about equally.
+    MotionEvidence analyzeMotion(const Track& t, const rclcpp::Time& stamp) const
+    {
+        MotionEvidence e;
+        const auto& h = t.motion_history;
+        if (h.size() < 3) return e;
+
+        e.span = (h.back().stamp - h.front().stamp).seconds();
+        if (e.span < min_motion_window_) return e;
+
+        const double t0 = h.front().stamp.seconds();
+        const double n = static_cast<double>(h.size());
+
+        double sum_t = 0.0, sum_x = 0.0, sum_y = 0.0;
+        for (const auto& s : h)
+        {
+            sum_t += s.stamp.seconds() - t0;
+            sum_x += s.pos.x;
+            sum_y += s.pos.y;
+        }
+        const double mean_t = sum_t / n, mean_x = sum_x / n, mean_y = sum_y / n;
+
+        double stt = 0.0, stx = 0.0, sty = 0.0;
+        for (const auto& s : h)
+        {
+            const double dt = (s.stamp.seconds() - t0) - mean_t;
+            stt += dt * dt;
+            stx += dt * (s.pos.x - mean_x);
+            sty += dt * (s.pos.y - mean_y);
+        }
+        if (stt < 1e-9) return e;
+
+        e.vx = stx / stt;
+        e.vy = sty / stt;
+        e.speed = speedNorm(e.vx, e.vy);
+
+        e.net_disp = std::hypot(h.back().pos.x - h.front().pos.x,
+                                h.back().pos.y - h.front().pos.y);
+        for (std::size_t i = 1; i < h.size(); ++i)
+        {
+            e.path_len += std::hypot(h[i].pos.x - h[i - 1].pos.x,
+                                     h[i].pos.y - h[i - 1].pos.y);
+        }
+        e.straightness = (e.path_len > 1e-6) ? (e.net_disp / e.path_len) : 0.0;
+
+        // History that has gone stale (track lost for a while) should not
+        // keep certifying motion that may be long over.
+        if ((stamp - h.back().stamp).seconds() > motion_window_) return e;
+
+        e.valid = true;
+        return e;
     }
 
     // ---- small utilities -------------------------------------------
@@ -309,8 +591,42 @@ private:
     // then sort by angle so buildSegments' sequential jump-distance
     // clustering (written for angularly-ordered LaserScan rays) still holds
     // on an otherwise unordered point cloud.
+    // One TF lookup for the whole cloud. The z = 0 plane is all this node
+    // works in, so the two relevant rows of the rotation matrix suffice and
+    // stay exact -- no small-angle assumption about roll/pitch.
+    bool lookupPlanarTransform(const std::string& source_frame,
+                               const rclcpp::Time& stamp,
+                               PlanarTransform& out,
+                               const std::string& target_frame_override = "")
+    {
+        const std::string& target =
+            target_frame_override.empty() ? output_frame_ : target_frame_override;
+        geometry_msgs::msg::TransformStamped tf;
+        try
+        {
+            tf = tf_buffer_->lookupTransform(target, source_frame, stamp,
+                                             tf2::durationFromSec(0.1));
+        }
+        catch (const tf2::TransformException& ex)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "Cloud transform failed: %s", ex.what());
+            return false;
+        }
+
+        const auto& q = tf.transform.rotation;
+        out.r00 = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        out.r01 = 2.0 * (q.x * q.y - q.z * q.w);
+        out.r10 = 2.0 * (q.x * q.y + q.z * q.w);
+        out.r11 = 1.0 - 2.0 * (q.x * q.x + q.z * q.z);
+        out.tx = tf.transform.translation.x;
+        out.ty = tf.transform.translation.y;
+        return true;
+    }
+
     std::vector<ScanPoint> extractValidPointsFromCloud(
-        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg)
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg,
+        const PlanarTransform& to_world)
     {
         std::vector<ScanPoint> pts;
         pts.reserve(static_cast<std::size_t>(cloud_msg->width) * cloud_msg->height);
@@ -335,6 +651,9 @@ private:
             p.angle = angle;
             p.x_laser = x;
             p.y_laser = y;
+            const Point2D w = to_world.apply(x, y);
+            p.x_world = w.x;
+            p.y_world = w.y;
             p.index = idx;
             pts.push_back(p);
         }
@@ -344,10 +663,54 @@ private:
         return pts;
     }
 
+    // Span of the cluster along its own principal axis and across it, via a
+    // 2x2 covariance eigen-decomposition and an exact projection of every
+    // point onto the resulting axes.
+    void computeSegmentExtent(const std::vector<ScanPoint>& raw,
+                              double& extent, double& thickness) const
+    {
+        const double n = static_cast<double>(raw.size());
+        double mx = 0.0, my = 0.0;
+        for (const auto& p : raw) { mx += p.x_laser; my += p.y_laser; }
+        mx /= n; my /= n;
+
+        double cxx = 0.0, cxy = 0.0, cyy = 0.0;
+        for (const auto& p : raw)
+        {
+            const double dx = p.x_laser - mx;
+            const double dy = p.y_laser - my;
+            cxx += dx * dx; cxy += dx * dy; cyy += dy * dy;
+        }
+        cxx /= n; cxy /= n; cyy /= n;
+
+        // Dominant eigenvector direction of the covariance matrix.
+        const double angle = 0.5 * std::atan2(2.0 * cxy, cxx - cyy);
+        const double ux = std::cos(angle), uy = std::sin(angle);
+
+        double min_u = std::numeric_limits<double>::infinity();
+        double max_u = -std::numeric_limits<double>::infinity();
+        double min_v = std::numeric_limits<double>::infinity();
+        double max_v = -std::numeric_limits<double>::infinity();
+        for (const auto& p : raw)
+        {
+            const double dx = p.x_laser - mx;
+            const double dy = p.y_laser - my;
+            const double u =  dx * ux + dy * uy;
+            const double v = -dx * uy + dy * ux;
+            min_u = std::min(min_u, u); max_u = std::max(max_u, u);
+            min_v = std::min(min_v, v); max_v = std::max(max_v, v);
+        }
+
+        extent = max_u - min_u;
+        thickness = max_v - min_v;
+    }
+
     void finalizeSegment(const std::vector<ScanPoint>& raw, std::vector<Segment>& out)
     {
-        if (raw.size() < static_cast<std::size_t>(segment_min_points_)) return;
-        if (raw.size() > static_cast<std::size_t>(segment_max_points_)) return;
+        if (raw.size() < static_cast<std::size_t>(segment_min_points_))
+        { ++stat_rej_minpts_; return; }
+        if (raw.size() > static_cast<std::size_t>(segment_max_points_))
+        { ++stat_rej_maxpts_; return; }
 
         Segment s;
         s.points = raw;
@@ -356,9 +719,10 @@ private:
         for (const auto& p : raw) { sum_r += p.range; sum_a += p.angle; }
         s.mean_range = sum_r / raw.size();
         s.mean_angle = sum_a / raw.size();
-        s.width = distLaser(raw.front(), raw.back());
+        computeSegmentExtent(raw, s.extent, s.thickness);
 
-        if (s.width < segment_min_width_ || s.width > segment_max_width_) return;
+        if (s.extent < segment_min_width_) { ++stat_rej_small_; return; }
+        if (s.extent > segment_max_width_) { ++stat_rej_big_; return; }
         out.push_back(s);
     }
 
@@ -425,6 +789,8 @@ private:
         for (std::size_t i = 0; i < pts.size(); ++i)
             clusters[ds.find(static_cast<int>(i))].push_back(pts[i]);
 
+        stat_clusters_ = clusters.size();
+        stat_rej_minpts_ = stat_rej_maxpts_ = stat_rej_small_ = stat_rej_big_ = 0;
         for (auto& entry : clusters)
         {
             std::vector<ScanPoint>& cluster_pts = entry.second;
@@ -707,42 +1073,35 @@ private:
         TrackPrediction result;
         result.origin = origin;
 
-        double pred_vx = 0.0, pred_vy = 0.0;
-        selectPredictionVelocity(t, stamp, pred_vx, pred_vy);
+        // Scenery, once proven, stays scenery.
+        if (t.confirmed_static) return result;
 
-        if (speedNorm(pred_vx, pred_vy) < min_dynamic_speed_)
-        {
-            // A single noisy below-threshold reading shouldn't throw away
-            // an otherwise-real motion streak: the raw per-cycle velocity
-            // estimate straddles min_dynamic_speed_ for a genuinely moving
-            // object often enough that a hard reset-on-any-dip never lets
-            // min_dynamic_persist_ accumulate. Only reset once the object
-            // has been below threshold for longer than the dip tolerance
-            // (i.e. it plausibly stopped, not just one jittery sample).
-            if (isZero(t.last_above_threshold_stamp) ||
-                (stamp - t.last_above_threshold_stamp).seconds() > dynamic_dip_tolerance_)
-            {
-                t.dynamic_streak_start = zeroTime();
-            }
-            return result;
-        }
-        t.last_above_threshold_stamp = stamp;
-        if (isZero(t.dynamic_streak_start))
-            t.dynamic_streak_start = stamp;
-        if ((stamp - t.dynamic_streak_start).seconds() < min_dynamic_persist_)
-            return result;
+        const MotionEvidence& ev = t.evidence;
+        if (!ev.valid) return result;
+        if (ev.speed < min_dynamic_speed_) return result;
+
+        // The decisive test: has the ground this object covered a moment ago
+        // actually cleared? A mover leaves; a structure the robot is merely
+        // driving past is still standing there however convincingly its
+        // visible slice appeared to slide. A verdict drawn from a short
+        // lookback has to be emphatic before it counts.
+        if (!t.has_persistence) return result;
+        const double threshold = (t.persistence_age >= persistence_delay_)
+                                     ? max_persistence_
+                                     : moving_persistence_;
+        if (t.persistence > threshold) return result;
 
         result.dynamic = true;
-        result.vx = pred_vx;
-        result.vy = pred_vy;
+        result.vx = ev.vx;
+        result.vy = ev.vy;
 
         for (double time = 0.0; time <= horizon + 1e-6; time += prediction_dt_)
         {
             geometry_msgs::msg::PoseStamped pose;
             pose.header = header;
             pose.pose.orientation.w = 1.0;
-            pose.pose.position.x = origin.x + pred_vx * time;
-            pose.pose.position.y = origin.y + pred_vy * time;
+            pose.pose.position.x = origin.x + result.vx * time;
+            pose.pose.position.y = origin.y + result.vy * time;
             pose.pose.position.z = z_height_;
             result.poses.push_back(pose);
         }
@@ -798,9 +1157,9 @@ private:
     }
 
     visualization_msgs::msg::Marker debugSegmentMarkerFor(const Segment& seg,
-                                                           const std::string& laser_frame,
                                                            const rclcpp::Time& stamp,
-                                                           int id)
+                                                           int id,
+                                                           const Track& t)
     {
         visualization_msgs::msg::Marker marker;
         marker.header.stamp = stamp;
@@ -812,16 +1171,22 @@ private:
         marker.pose.orientation.w = 1.0;
         marker.scale.x = 0.06;
         marker.scale.y = 0.06;
-        marker.color.g = 1.0;
+        // Channels carry the statistics the classifier uses, so they are
+        // visible in RViz and readable by offline tooling without a bespoke
+        // message: red = footprint persistence (1 = never moved), green =
+        // straightness, blue = net displacement scaled over 2 m.
+        auto unit = [](double v) {
+            return static_cast<float>(std::max(0.0, std::min(1.0, v)));
+        };
+        marker.color.r = unit(t.persistence);
+        marker.color.g = unit(t.evidence.straightness);
+        marker.color.b = unit(t.evidence.net_disp / 2.0);
         marker.color.a = 1.0;
 
         for (const auto& sp : seg.points)
         {
-            Point2D p_world;
-            if (!laserPointToWorld({sp.x_laser, sp.y_laser}, laser_frame, stamp, p_world))
-                continue;
             geometry_msgs::msg::Point p;
-            p.x = p_world.x; p.y = p_world.y; p.z = z_height_;
+            p.x = sp.x_world; p.y = sp.y_world; p.z = z_height_;
             marker.points.push_back(p);
         }
         return marker;
@@ -848,7 +1213,6 @@ private:
     // /predicted_obstacle_debug_segment, which only ever shows segments
     // that already got matched to a track.
     void publishRawSegments(const std::vector<Segment>& segments,
-                            const std::string& cloud_frame,
                             const rclcpp::Time& stamp)
     {
         visualization_msgs::msg::MarkerArray array;
@@ -870,11 +1234,8 @@ private:
 
             for (const auto& sp : segments[j].points)
             {
-                Point2D p_world;
-                if (!laserPointToWorld({sp.x_laser, sp.y_laser}, cloud_frame, stamp, p_world))
-                    continue;
                 geometry_msgs::msg::Point p;
-                p.x = p_world.x; p.y = p_world.y; p.z = z_height_;
+                p.x = sp.x_world; p.y = sp.y_world; p.z = z_height_;
                 marker.points.push_back(p);
             }
             array.markers.push_back(marker);
@@ -960,9 +1321,12 @@ private:
 
             Track& t = spawnTrack(center_world, stamp);
             t.last_range = segments[j].mean_range;
+            t.last_extent = segments[j].extent;
             t.matched_this_cycle = true;
+            pushMotionSample(t, center_world, stamp);
+            pushFootprint(t, segments[j], stamp);
             debug_array.markers.push_back(debugSegmentMarkerFor(
-                segments[j], cloud_msg->header.frame_id, stamp, t.id));
+                segments[j], stamp, t.id, t));
         }
     }
 
@@ -971,7 +1335,12 @@ private:
     void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_msg)
     {
         const rclcpp::Time stamp(cloud_msg->header.stamp);
-        const auto valid_pts = extractValidPointsFromCloud(cloud_msg);
+
+        PlanarTransform to_world;
+        if (!lookupPlanarTransform(cloud_msg->header.frame_id, stamp, to_world))
+            return;
+
+        const auto valid_pts = extractValidPointsFromCloud(cloud_msg, to_world);
         if (valid_pts.empty())
         {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -980,8 +1349,19 @@ private:
             return;
         }
 
+        // Looked up rather than inverted: the 2x2 block of a 3D rotation is
+        // only orthogonal when roll and pitch are zero.
+        if (!lookupPlanarTransform(output_frame_, stamp, world_to_sensor_,
+                                   cloud_msg->header.frame_id))
+            return;
+
+        buildCurrentGrid(valid_pts);
+
+
         const auto segments = buildSegments(valid_pts);
-        publishRawSegments(segments, cloud_msg->header.frame_id, stamp);
+
+        publishRawSegments(segments, stamp);
+
 
         if (segments.empty())
         {
@@ -1012,10 +1392,11 @@ private:
             Track& t = tracks_[i];
             t.matched_this_cycle = true;
             t.last_range = segments[static_cast<std::size_t>(seg_idx)].mean_range;
+            t.last_extent = segments[static_cast<std::size_t>(seg_idx)].extent;
             const Point2D measurement_world = assignment.track_measurement_world[i];
 
             debug_array.markers.push_back(debugSegmentMarkerFor(
-                segments[static_cast<std::size_t>(seg_idx)], cloud_msg->header.frame_id, stamp, t.id));
+                segments[static_cast<std::size_t>(seg_idx)], stamp, t.id, t));
 
             const double dt = (stamp - t.last_stamp).seconds();
             if (dt < 0.0 || dt > track_timeout_)
@@ -1030,8 +1411,17 @@ private:
             {
                 updateTrack(t, measurement_world, dt);
                 t.last_stamp = stamp;
-                refreshHeldVelocity(t, stamp);
             }
+
+            // History is fed the raw association, not the alpha-beta output,
+            // so the window statistics stay independent of that filter's own
+            // smoothing and lag.
+            pushMotionSample(t, measurement_world, stamp);
+
+            pushFootprint(t, segments[static_cast<std::size_t>(seg_idx)], stamp);
+            updatePersistence(t, stamp);
+
+            t.evidence = analyzeMotion(t, stamp);
         }
 
         // 2) Unmatched existing tracks: dead-reckon or expire. Dead-reckon
@@ -1285,11 +1675,28 @@ private:
     double max_speed_;
     double track_timeout_;
     double lost_track_prediction_time_;
-    double prediction_hold_time_;
-    double prediction_hold_speed_epsilon_;
     double min_dynamic_speed_;
-    double min_dynamic_persist_;
-    double dynamic_dip_tolerance_;
+
+    double motion_window_;
+    double min_motion_window_;
+
+    double occupancy_match_radius_;
+    int occupancy_support_count_;
+    double persistence_delay_;
+    double persistence_fast_delay_;
+    double persistence_keep_extra_;
+    int persistence_min_points_;
+    double persistence_smoothing_;
+    int footprint_points_;
+    double max_persistence_;
+    double static_confirm_persistence_;
+    int static_confirm_samples_;
+    double moving_persistence_;
+    PlanarTransform world_to_sensor_;
+    std::unordered_map<int64_t, std::vector<Point2D>> current_grid_;
+
+    std::size_t stat_clusters_{0}, stat_rej_minpts_{0}, stat_rej_maxpts_{0};
+    std::size_t stat_rej_small_{0}, stat_rej_big_{0};
 
     double point_spacing_;
     double corridor_radius_;

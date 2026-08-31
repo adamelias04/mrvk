@@ -12,3 +12,6 @@ __pycache__/
 .claude/settings.local.json
 *.swp
 .DS_Store
+
+# predictor evaluation artifacts (regenerate with tools/run_eval.sh)
+tools/results/

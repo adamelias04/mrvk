@@ -9,15 +9,35 @@ dynamic_obstacle_predictor:
     max_speed: 2.0
     track_timeout: 1.2
     lost_track_prediction_time: 1.6
-    prediction_hold_time: 0.8
-    prediction_hold_speed_epsilon: 0.08
-    min_dynamic_speed: 0.3
-    min_dynamic_persist: 0.3
-    dynamic_dip_tolerance: 0.3
+
+    # Motion is judged over a window rather than frame to frame: a single
+    # difference amplifies the ~0.1-0.2 m of jitter a partially-observed
+    # cluster's position naturally has into an apparent 0.3 m/s, which is
+    # exactly the speed a walking person moves at.
+    motion_window: 3.0
+    min_motion_window: 0.6
+    min_dynamic_speed: 0.25
+
+    # Static/dynamic is decided by whether the ground the object covered a
+    # moment ago has cleared, not by how fast its centroid appears to move.
+    # A fence stays put; only its visible slice slides as the robot drives
+    # past, and no amount of velocity filtering can tell those apart.
+    persistence_delay: 1.5        # preferred lookback for the verdict
+    persistence_fast_delay: 0.7   # shortest lookback that may be judged at all
+    persistence_keep_extra: 0.5
+    persistence_min_points: 5     # in-range footprint anchors needed to judge
+    persistence_smoothing: 0.35
+    footprint_points: 24
+    max_persistence: 0.3          # at full lookback: cleared this much == moving
+    moving_persistence: 0.2       # stricter bar demanded of a short lookback
+    static_confirm_persistence: 0.45
+    static_confirm_samples: 2     # repeats before a track is latched scenery
+    occupancy_match_radius: 0.35
+    occupancy_support_count: 3    # lone stray points do not prove occupancy
+
     point_spacing: 0.05
     corridor_radius: 0.18
     object_half_extent: 0.18
-    center_side_hysteresis: 0.5
     z_height: 0.10
     scan_range_min_use: 0.10
     scan_range_max_use: 15.00
@@ -25,7 +45,11 @@ dynamic_obstacle_predictor:
     segment_min_points: 20
     segment_max_points: 600
     segment_min_width: 0.03
-    segment_max_width: 2.00
+    # Deliberately generous: a long structure has to be allowed to form ONE
+    # cluster so it can be tracked and latched as scenery. Rejecting it
+    # outright only scattered it into short-lived fragments that each looked
+    # like a fresh moving object.
+    segment_max_width: 4.00
     use_angle_roi: false
     angle_min_roi: -1.57
     angle_max_roi: 1.57
@@ -36,4 +60,4 @@ dynamic_obstacle_predictor:
     initial_expected_range: 2.5
     max_association_distance: 2.0
     publish_debug_segment: true
-    max_tracks: 10
+    max_tracks: 25
