@@ -43,7 +43,13 @@ dynamic_obstacle_predictor:
     scan_range_max_use: 15.00
     segment_jump_distance: 0.30
     segment_min_points: 20
-    segment_max_points: 600
+    # Only a runaway guard, NOT a size filter -- size is what
+    # segment_max_width is for. A point count means "how close is it", not
+    # "how big is it": the Livox puts 400-1600 points on a person at 3-4 m,
+    # so a cap of 600 (harmless back when the input was a LaserScan with a
+    # few hundred rays per scan) silently deleted every pedestrian the robot
+    # got near -- they never became a segment at all, let alone a track.
+    segment_max_points: 5000
     segment_min_width: 0.03
     # Deliberately generous: a long structure has to be allowed to form ONE
     # cluster so it can be tracked and latched as scenery. Rejecting it

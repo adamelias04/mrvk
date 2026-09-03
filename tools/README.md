@@ -57,3 +57,21 @@ classifier (mean of repeated runs, replay rate 2.0):
 | pivo0001 | 1707 -> 111 (-93%) | 1035 -> 831 (-20%) | 0.623 -> 0.118 |
 
 pivo0001 was not used for tuning.
+
+### segment_max_points
+
+A point count says how CLOSE a cluster is, not how big -- the Livox puts
+400-1600 points on a person at 3-4 m. The cap of 600 was harmless while the
+input was a LaserScan of a few hundred rays, but on the pointcloud it deleted
+pedestrians outright: in jk0009 the person walking past at t=9-16 s produced a
+raw segment in 6 frames out of ~70 and never a prediction. Raised to 5000
+(a runaway guard; size is `segment_max_width`'s job):
+
+| scene    | fp_frames | tp_frames  | fp_rate       | pedestrians found |
+|----------|-----------|------------|---------------|-------------------|
+| jk0009   | 207 -> 300 | 663 -> 1488 | 0.238 -> 0.168 | 10 -> 23 |
+| pivo0001 | 105 -> 130 | 911 -> 1167 | 0.103 -> 0.100 | 15 -> 15 |
+
+Predictions on long-lived scenery stay put (103 -> 104 frames on jk0009,
+80 -> 98 on pivo0001), so the extra fp_frames are short-lived tracks, not a
+return of the fence problem.
