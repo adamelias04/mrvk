@@ -14,8 +14,6 @@ def generate_launch_description():
 
     default_model = os.path.join(pkg_desc, 'urdf', 'robot.urdf.xacro')
     default_rviz = os.path.join(pkg_gazebo, 'config', 'rviz', 'config.rviz')
-    default_p2l_params = os.path.join(
-        pkg_gazebo, 'config', 'laserscan', 'pointcloud_to_laserscan.yaml')
 
     model = LaunchConfiguration('model')
     use_rviz = LaunchConfiguration('rviz')
@@ -51,17 +49,6 @@ def generate_launch_description():
         condition=IfCondition(use_rviz),
     )
 
-    pointcloud_to_laserscan = Node(
-        package='pointcloud_to_laserscan',
-        executable='pointcloud_to_laserscan_node',
-        name='pointcloud_to_laserscan',
-        output='screen',
-        parameters=[default_p2l_params, {'use_sim_time': False}],
-        remappings=[
-            ('cloud_in', '/cloud_registered_body'),
-            ('scan', '/scan'),
-        ],
-    )
 
     # PLACEHOLDER: livox_ros_driver not yet vendored
     livox_driver = Node(
@@ -105,7 +92,6 @@ def generate_launch_description():
         robot_state_publisher,
         joint_state_publisher,
         rviz,
-        pointcloud_to_laserscan,
         livox_driver,
         fast_lio,
         ublox_gps,

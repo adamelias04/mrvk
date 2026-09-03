@@ -134,8 +134,26 @@ local_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         footprint_clearing_enabled: true
-        observation_sources: scan_marking scan_clearing
-        scan_marking:
+        # Two sources on purpose, only one of which exists at a time.
+        # On the robot and in bag replay the obstacles come from the
+        # ground-segmented 3D cloud; /scan no longer exists there at all
+        # (pointcloud_to_laserscan is gone, and slicing a height band out of
+        # a cloud that has already had the ground removed added nothing).
+        # In Gazebo it is the other way round: the simulated Hokuyo publishes
+        # /scan natively and there is no 3D cloud to segment. A source whose
+        # topic is silent simply never contributes, so one config serves both.
+        observation_sources: obstacle_cloud sim_scan_marking sim_scan_clearing
+        obstacle_cloud:
+          topic: /ground_segmentation/obstacle_points
+          sensor_frame: base_link
+          data_type: "PointCloud2"
+          marking: true
+          clearing: true
+          obstacle_max_range: 15.0
+          raytrace_max_range: 15.0
+          min_obstacle_height: -1.0
+          max_obstacle_height: 2.5
+        sim_scan_marking:
           topic: /scan
           sensor_frame: lidar_frame
           data_type: "LaserScan"
@@ -146,7 +164,7 @@ local_costmap:
           raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
-        scan_clearing:
+        sim_scan_clearing:
           topic: /scan
           sensor_frame: lidar_frame
           data_type: "LaserScan"
@@ -200,8 +218,26 @@ global_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         footprint_clearing_enabled: true
-        observation_sources: scan_marking scan_clearing
-        scan_marking:
+        # Two sources on purpose, only one of which exists at a time.
+        # On the robot and in bag replay the obstacles come from the
+        # ground-segmented 3D cloud; /scan no longer exists there at all
+        # (pointcloud_to_laserscan is gone, and slicing a height band out of
+        # a cloud that has already had the ground removed added nothing).
+        # In Gazebo it is the other way round: the simulated Hokuyo publishes
+        # /scan natively and there is no 3D cloud to segment. A source whose
+        # topic is silent simply never contributes, so one config serves both.
+        observation_sources: obstacle_cloud sim_scan_marking sim_scan_clearing
+        obstacle_cloud:
+          topic: /ground_segmentation/obstacle_points
+          sensor_frame: base_link
+          data_type: "PointCloud2"
+          marking: true
+          clearing: true
+          obstacle_max_range: 15.0
+          raytrace_max_range: 15.0
+          min_obstacle_height: -1.0
+          max_obstacle_height: 2.5
+        sim_scan_marking:
           topic: /scan
           sensor_frame: lidar_frame
           data_type: "LaserScan"
@@ -212,7 +248,7 @@ global_costmap:
           raytrace_max_range: 18.0
           min_obstacle_height: 0.0
           max_obstacle_height: 2.0
-        scan_clearing:
+        sim_scan_clearing:
           topic: /scan
           sensor_frame: lidar_frame
           data_type: "LaserScan"

@@ -15,8 +15,6 @@ def generate_launch_description():
 
     default_model = os.path.join(pkg_desc, 'urdf', 'robot.urdf.xacro')
     default_rviz = os.path.join(pkg_gazebo, 'config', 'rviz', 'bag_replay.rviz')
-    default_p2l_params = os.path.join(
-        pkg_gazebo, 'config', 'laserscan', 'pointcloud_to_laserscan.yaml')
     default_predictor_params = os.path.join(
         pkg_gazebo, 'config', 'predictor', 'dynamic_obstacle_predictor.yaml')
     default_ground_seg_params = os.path.join(
@@ -42,27 +40,17 @@ def generate_launch_description():
         parameters=[robot_description],
     )
 
-    pointcloud_to_laserscan = Node(
-        package='pointcloud_to_laserscan',
-        executable='pointcloud_to_laserscan_node',
-        name='pointcloud_to_laserscan',
-        output='screen',
-        parameters=[default_p2l_params, {'use_sim_time': True}],
-        remappings=[
-            ('cloud_in', '/cloud_registered_body'),
-            ('scan', '/scan'),
-        ],
-    )
 
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(pkg_gazebo, 'launch', 'nav2.launch.py')),
         launch_arguments={'planner': planner}.items(),
     )
 
+    # Not conditional on `predict`: the Nav2 obstacle layer now takes its
+    # obstacles from this cloud too, not just the predictor.
     ground_segmentation = Node(
         package='ground_segmentation_ros2', executable='ground_segmentation_ros2_node',
         name='ground_segmentation', output='screen',
-        condition=IfCondition(use_predict),
         parameters=[default_ground_seg_params, {'use_sim_time': True}],
         remappings=[
             ('/ground_segmentation/input_pointcloud', '/cloud_registered_body'),
@@ -97,7 +85,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('bag_path', default_value='/home/adam/ws/rosbags/pivo0001'),
+        DeclareLaunchArgument('bag_path', default_value='/home/adam/ws/rosbags/jk0009'),
         DeclareLaunchArgument('qos_overrides_path',
                               default_value=PathJoinSubstitution([bag_path, 'qos_overrides.yaml'])),
         DeclareLaunchArgument('model', default_value=default_model),
@@ -107,7 +95,6 @@ def generate_launch_description():
         DeclareLaunchArgument('predict', default_value='true',
                               description='Run dynamic_obstacle_predictor'),
         robot_state_publisher,
-        pointcloud_to_laserscan,
         nav2,
         ground_segmentation,
         dynamic_obstacle_predictor,
