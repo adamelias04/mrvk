@@ -225,6 +225,11 @@ private:
 
         motion_window_ = declare_parameter<double>("motion_window", 2.0);
         min_motion_window_ = declare_parameter<double>("min_motion_window", 0.6);
+        // How long a motion verdict stays usable after the last measurement.
+        // Deliberately NOT the regression window: shortening that one to cut
+        // the heading lag would otherwise also make a briefly occluded mover
+        // lose its prediction, which has nothing to do with lag.
+        motion_staleness_ = declare_parameter<double>("motion_staleness", 3.0);
 
 
         point_spacing_ = declare_parameter<double>("point_spacing", 0.05);
@@ -545,7 +550,7 @@ private:
 
         // History that has gone stale (track lost for a while) should not
         // keep certifying motion that may be long over.
-        if ((stamp - h.back().stamp).seconds() > motion_window_) return e;
+        if ((stamp - h.back().stamp).seconds() > motion_staleness_) return e;
 
         e.valid = true;
         return e;
@@ -1679,6 +1684,7 @@ private:
 
     double motion_window_;
     double min_motion_window_;
+    double motion_staleness_;
 
     double occupancy_match_radius_;
     int occupancy_support_count_;

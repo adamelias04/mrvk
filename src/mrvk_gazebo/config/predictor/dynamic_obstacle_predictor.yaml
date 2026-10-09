@@ -14,8 +14,19 @@ dynamic_obstacle_predictor:
     # difference amplifies the ~0.1-0.2 m of jitter a partially-observed
     # cluster's position naturally has into an apparent 0.3 m/s, which is
     # exactly the speed a walking person moves at.
-    motion_window: 3.0
+    # Length of the regression window the velocity is fitted over. A fit
+    # across W seconds returns the AVERAGE velocity over that window, i.e.
+    # the heading the object had at its midpoint -- so the published heading
+    # lags reality by W/2. On a straight path that is invisible; on a curved
+    # one it is the whole error. Measured on jk0009 (person walking a circle,
+    # track 51): at 3.0 the heading was 43 deg off and matched the truth from
+    # 1.2 s earlier; at 1.2 it is 14 deg off with a 0.4 s lag.
+    motion_window: 1.2
     min_motion_window: 0.6
+    # Separate from the window above on purpose: this is only how long a
+    # verdict survives without new measurements, so a mover that is briefly
+    # occluded keeps its prediction.
+    motion_staleness: 3.0
     min_dynamic_speed: 0.25
 
     # Static/dynamic is decided by whether the ground the object covered a
