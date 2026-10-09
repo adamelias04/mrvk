@@ -2,7 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+                            IncludeLaunchDescription, SetEnvironmentVariable)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
@@ -85,7 +86,20 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('bag_path', default_value='/home/adam/ws/rosbags/jk0009'),
+        # Replay is entirely local, so pin the middleware instead of
+        # inheriting whatever the shell was last pointed at. A shell left
+        # configured for the robot (RMW_IMPLEMENTATION=rmw_zenoh_cpp with
+        # ZENOH_CONFIG_OVERRIDE naming the robot's router) makes every node
+        # block in rmw init waiting for a router that is not on this network:
+        # all processes start, nothing is ever printed, and the launch just
+        # hangs. Override `rmw` if you really do want to replay over zenoh --
+        # then a router has to be running and ZENOH_CONFIG_OVERRIDE set.
+        DeclareLaunchArgument('rmw', default_value='rmw_fastrtps_cpp',
+                              description='RMW for the replay processes'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', LaunchConfiguration('rmw')),
+        SetEnvironmentVariable('ZENOH_CONFIG_OVERRIDE', ''),
+
+        DeclareLaunchArgument('bag_path', default_value='/home/adam/ws/rosbags/pivo0001'),
         DeclareLaunchArgument('qos_overrides_path',
                               default_value=PathJoinSubstitution([bag_path, 'qos_overrides.yaml'])),
         DeclareLaunchArgument('model', default_value=default_model),

@@ -18,6 +18,12 @@ mkdir -p /home/adam/ws/tools/results
 source /opt/ros/humble/setup.bash
 source /home/adam/ws/install/setup.bash
 
+# Pin the middleware: a shell left configured for the robot (zenoh client
+# pointing at a router that is not on this network) makes every node fail or
+# hang in rmw init, and the run dies with an unrelated-looking error.
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+unset ZENOH_CONFIG_OVERRIDE
+
 pkill -f "dynamic_obstacle_predictor" 2>/dev/null || true
 pkill -f "bag play $BAG" 2>/dev/null || true
 sleep 1
